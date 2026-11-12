@@ -218,3 +218,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# HackingBara local state
+node_modules/
+frontend/dist/
+secrets/
+test-results/
+playwright-report/
+*.db
+agent_spec.md

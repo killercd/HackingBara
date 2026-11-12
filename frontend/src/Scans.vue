@@ -1,0 +1,12 @@
+<script setup lang="ts">
+import { ref } from 'vue'
+import { useRouter } from 'vue-router'
+import DataTable from './DataTable.vue'
+import { api } from './api'
+import { startScan } from './actions'
+const table=ref<InstanceType<typeof DataTable>>(),error=ref(''),busy=ref(false),router=useRouter()
+const columns=[{key:'name',label:'Scan name'},{key:'target_summary',label:'Authorized targets'},{key:'last_status',label:'Last run'},{key:'summary',label:'Progress / counts'},{key:'last_run_at',label:'Launched'},{key:'updated_at',label:'Updated'}]
+async function start(row:Record<string,any>){busy.value=true;try{const run=await startScan(row.id,row.target_summary);if(run)await router.push(`/scans/${row.id}/runs/${run.id}`)}catch(e){error.value=(e as Error).message}finally{busy.value=false}}
+async function remove(row:Record<string,any>){if(!confirm(`Delete "${row.name}" and all its run history and evidence? This cannot be undone.`))return;try{await api(`/scans/${row.id}`,'DELETE');await table.value?.load()}catch(e){error.value=(e as Error).message}}
+</script>
+<template><div class="page-heading"><div><p class="eyebrow">NETWORK ASSESSMENTS</p><h1>Scans<span class="accent">.</span></h1><p class="muted">Define your scope. Discover services. Track what changes.</p></div><RouterLink class="button" to="/scans/new">+ New scan</RouterLink></div><p v-if="error" class="error" role="alert">{{error}}</p><DataTable ref="table" endpoint="/scans" :columns="columns" :refresh="5000" filter-status><template #name="{row}"><RouterLink :to="`/scans/${row.id}`" class="strong">{{row.name}}</RouterLink><small>{{row.config.screenshots?'Screenshots · ':''}}{{row.config.password_spray?'Credential validation':'Discovery'}} · {{row.config.ports}}</small></template><template #summary="{row}"><span v-if="row.latest_run">{{row.latest_run.processed}} / {{row.latest_run.total}} targets<small>{{row.latest_run.counts.hosts||0}} hosts · {{row.latest_run.counts.services||0}} services · {{row.latest_run.counts.findings||0}} findings</small></span><span v-else>—</span></template><template #actions="{row}"><button class="subtle" :disabled="busy" @click="start(row)">Start</button><RouterLink class="button subtle" v-if="row.latest_run" :to="`/scans/${row.id}/runs/${row.latest_run.id}`">Results</RouterLink><RouterLink class="button subtle" :to="`/scans/${row.id}/edit`">Edit</RouterLink><button class="danger subtle" @click="remove(row)">Delete</button></template></DataTable></template>
