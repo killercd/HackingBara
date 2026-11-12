@@ -1,3 +1,13 @@
+<p align="center">
+  <img src="imgs/capbar.png" alt="HackingBara cyberpunk capybara mascot" width="140" />
+  <br />
+  <img src="imgs/hackingbara-wordmark.svg" alt="HackingBara" width="420" />
+</p>
+<p align="center">
+  <strong>Discover. Enumerate. Observe.</strong><br />
+  <a href="imgs/hackingbara-logo.svg">Full project logo</a>
+</p>
+
 # HackingBara
 
 Self-hosted network assessment workspace built with FastAPI, Celery, PostgreSQL and Vue 3. Use only on systems and accounts you own or are explicitly authorized to assess. Every run requires approval of its exact scope. All users have the same capabilities.
