@@ -21,12 +21,12 @@ def launch(auth, scan):
 def fake_tools(monkeypatch):
     calls = []
 
-    def rust(address, ports, timeout, tick):
+    def rust(address, ports, timeout, tick, **options):
         tick()
         calls.append(("rustscan", address, ports))
         return [80], ToolResult("192.0.2.1 -> [80]", "", 0, 0.1), ["rustscan", "-a", address]
 
-    def nmap(address, discovered, timeout, tick):
+    def nmap(address, discovered, timeout, tick, **options):
         tick()
         calls.append(("nmap", address, discovered))
         assert discovered == [80]
@@ -39,9 +39,9 @@ def fake_tools(monkeypatch):
     monkeypatch.setattr(scanners, "rustscan", rust)
     monkeypatch.setattr(scanners, "nmap", nmap)
     monkeypatch.setattr(
-        pipeline, "basic_auth", lambda *a: pytest.fail("Credential validation must be opt-in")
+        pipeline, "basic_auth", lambda *a, **k: pytest.fail("Credential validation must be opt-in")
     )
-    monkeypatch.setattr(pipeline, "capture", lambda *a: pytest.fail("Screenshots must be opt-in"))
+    monkeypatch.setattr(pipeline, "capture", lambda *a, **k: pytest.fail("Screenshots must be opt-in"))
     return calls
 
 
@@ -61,7 +61,7 @@ def test_pipeline_partial_results_history_and_rerun(auth, scan, db_factory, fake
     second = launch(auth, scan)
     Runner(second, claim(second)).run()
     assert auth.get(f"/api/v1/runs/{second}/services").json()["items"][0]["change"] == "unchanged"
-    monkeypatch.setattr(scanners, "rustscan", lambda *a: ([], ToolResult("", "", 0, 0.1), ["rustscan"]))
+    monkeypatch.setattr(scanners, "rustscan", lambda *a, **k: ([], ToolResult("", "", 0, 0.1), ["rustscan"]))
     third = launch(auth, scan)
     Runner(third, claim(third)).run()
     services = auth.get(f"/api/v1/runs/{third}/services").json()["items"]
@@ -75,8 +75,8 @@ def test_pause_resume_checkpoint_does_not_repeat_discovery(auth, scan, db_factor
     owner = claim(identity)
     original = scanners.rustscan
 
-    def pause(*args):
-        result = original(*args)
+    def pause(*args, **options):
+        result = original(*args, **options)
         assert auth.post(f"/api/v1/runs/{identity}/pause").json()["status"] == "pausing"
         return result
 
@@ -95,7 +95,7 @@ def test_stop_during_tool_preserves_results(auth, scan, db_factory, fake_tools, 
     identity = launch(auth, scan)
     owner = claim(identity)
 
-    def stop(address, discovered, timeout, tick):
+    def stop(address, discovered, timeout, tick, **options):
         auth.post(f"/api/v1/runs/{identity}/stop")
         tick(True)
 
@@ -324,8 +324,8 @@ def test_scanner_metadata_and_banners_redact_selected_secrets(auth, db_factory, 
     ).json()
     original = scanners.nmap
 
-    def banner(*args):
-        rows, result, argv = original(*args)
+    def banner(*args, **options):
+        rows, result, argv = original(*args, **options)
         rows[0]["banner"] = "a banner with do-not-leak"
         result.stderr = "untrusted output do-not-leak"
         return rows, result, argv
@@ -467,3 +467,31 @@ def test_out_of_scope_is_reported_separately_from_dns_failure(auth, monkeypatch)
     error = response.json()["error"]
     assert "outside the authorized scope" in error["message"]
     assert error["details"][0]["field"] == "http://outside.example/"
+
+
+def test_network_timing_settings_reach_both_tools(auth, scan, fake_tools, monkeypatch):
+    assert (
+        auth.patch(
+            f"/api/v1/scans/{scan['id']}",
+            json={"request_timeout": 1.25, "max_threads": 48, "network_timing": 4},
+        ).status_code
+        == 200
+    )
+    rust, nmap = scanners.rustscan, scanners.nmap
+
+    def discover(address, ports, request_timeout, tick, **options):
+        assert request_timeout == 1.25 and options["max_threads"] == 48
+        return rust(address, ports, request_timeout, tick, **options)
+
+    def enumerate_services(address, ports, request_timeout, tick, **options):
+        assert request_timeout == 1.25 and options == {"max_threads": 48, "timing": 4}
+        return nmap(address, ports, request_timeout, tick, **options)
+
+    monkeypatch.setattr(scanners, "rustscan", discover)
+    monkeypatch.setattr(scanners, "nmap", enumerate_services)
+    identity = launch(auth, scan)
+    Runner(identity, claim(identity)).run()
+    run = auth.get(f"/api/v1/runs/{identity}").json()
+    assert run["status"] == "completed" and run["counts"]["errors"] == 0
+    assert "timeout" not in run["config_snapshot"]
+    assert [call[0] for call in fake_tools] == ["rustscan", "nmap"]

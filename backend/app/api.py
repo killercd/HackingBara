@@ -1,3 +1,4 @@
+import json
 import math
 import shutil
 from datetime import datetime, timedelta
@@ -6,15 +7,16 @@ from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import String, cast, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
+from starlette.datastructures import UploadFile
 
 from . import models as m
 from .config import settings
 from .db import get_db, now
-from .scope import ScanInput, Scope, ScopePreparationError, prepare_run_config
+from .scope import ScanInput, Scope, ScopePreparationError, import_wordlist, prepare_run_config
 from .security import DUMMY_HASH, cipher, create_session, current_user, digest, verify
 
 router = APIRouter(prefix="/api/v1")
@@ -229,7 +231,11 @@ def save_scan(db, scan, body):
         raise HTTPException(422, "Unknown credential reference")
     scan.name, scan.description = body.name, body.description
     scan.config = body.model_dump()
-    scan.target_summary = ", ".join(body.targets + body.urls)
+    scan.target_summary = (
+        f"{body.domain} ({len(body.subdomains)} DNS candidates)"
+        if body.mode == "subdomain"
+        else ", ".join(body.targets + body.urls)
+    )
     db.add(scan)
     db.flush()
     db.query(m.ScanCredential).filter_by(scan_id=scan.id).delete()
@@ -239,9 +245,77 @@ def save_scan(db, scan, body):
     return serialize(scan)
 
 
+MAX_WORDLIST_BYTES = 3 * 1024 * 1024
+MAX_SCAN_REQUEST_BYTES = 4 * 1024 * 1024
+
+
+async def scan_input(request: Request, existing=None):
+    if int(request.headers.get("content-length", "0")) > MAX_SCAN_REQUEST_BYTES:
+        raise HTTPException(413, "Scan request must be at most 4 MiB; wordlist files at most 3 MiB")
+    try:
+        if request.headers.get("content-type", "").startswith("multipart/form-data"):
+            async with request.form(max_files=1, max_fields=1, max_part_size=65536) as form:
+                if set(form) != {"config", "wordlist"} or not isinstance(form["wordlist"], UploadFile):
+                    raise HTTPException(422, "Provide config and one wordlist file")
+                body = json.loads(form["config"])
+                if not isinstance(body, dict):
+                    raise HTTPException(422, "Scan configuration must be an object")
+                upload = form["wordlist"]
+                content = await upload.read(MAX_WORDLIST_BYTES + 1)
+                if len(content) > MAX_WORDLIST_BYTES:
+                    raise HTTPException(413, "Wordlist must be at most 3 MiB")
+                try:
+                    text_content = content.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    raise HTTPException(422, "Wordlist must be a UTF-8 text file") from None
+                raw_domain = body.get("domain", (existing or {}).get("domain", ""))
+                if not isinstance(raw_domain, str):
+                    raise HTTPException(422, "Base domain must be a string")
+                domain = ScanInput.clean_domain(raw_domain)
+                if not domain:
+                    raise HTTPException(422, "Provide a base domain before importing the wordlist")
+                words, report = import_wordlist(text_content, domain)
+                if not words:
+                    raise HTTPException(
+                        422,
+                        {
+                            "message": "Wordlist contains no valid subdomain names",
+                            "details": [
+                                {"field": "wordlist", "message": sample} for sample in report.examples
+                            ],
+                        },
+                    )
+                body = {
+                    **body,
+                    "subdomains": words,
+                    "wordlist_import": report.model_dump(),
+                    "wordlist_filename": (upload.filename or "wordlist.txt")
+                    .replace("\\", "/")
+                    .split("/")[-1][:200],
+                }
+        else:
+            body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(422, "Scan configuration must be an object")
+        return ScanInput.model_validate({**(existing or {}), **body})
+    except ValidationError as exc:
+        raise HTTPException(
+            422,
+            {
+                "message": "Invalid scan configuration",
+                "details": [
+                    {"field": ".".join(map(str, error["loc"])), "message": error["msg"]}
+                    for error in exc.errors()
+                ],
+            },
+        ) from None
+    except (ValueError, TypeError):
+        raise HTTPException(422, "Invalid scan configuration or multipart upload") from None
+
+
 @router.post("/scans", status_code=201)
-def create_scan(body: ScanInput, user: User, db: DB):
-    return save_scan(db, m.Scan(), body)
+async def create_scan(request: Request, user: User, db: DB):
+    return save_scan(db, m.Scan(), await scan_input(request))
 
 
 @router.get("/scans/{scan_id}")
@@ -250,13 +324,9 @@ def scan_detail(scan_id: str, user: User, db: DB):
 
 
 @router.patch("/scans/{scan_id}")
-def update_scan(scan_id: str, body: dict, user: User, db: DB):
+async def update_scan(scan_id: str, request: Request, user: User, db: DB):
     scan = get_or_404(db, m.Scan, scan_id)
-    try:
-        data = ScanInput.model_validate({**scan.config, **body})
-    except ValueError:
-        raise HTTPException(422, "Invalid scan configuration") from None
-    return save_scan(db, scan, data)
+    return save_scan(db, scan, await scan_input(request, scan.config))
 
 
 @router.delete("/scans/{scan_id}", status_code=204)
@@ -320,7 +390,9 @@ def start_run(scan_id: str, body: Launch, user: User, db: DB):
         scan_id=scan_id,
         config_snapshot=config.model_dump(),
         initiated_by=user.id,
-        total=len(Scope(config.targets).addresses()),
+        total=len(config.subdomains)
+        if config.mode == "subdomain"
+        else len(Scope(config.targets).addresses()),
     )
     db.add(run)
     db.flush()
@@ -393,6 +465,7 @@ def control_run(run_id: str, action: str, user: User, db: DB):
 
 
 COLLECTIONS = {
+    "subdomains": m.Finding,
     "hosts": m.RunHost,
     "ports": m.ServiceObservation,
     "services": m.ServiceObservation,
@@ -414,7 +487,10 @@ def run_collection(run_id: str, collection: str, user: User, db: DB, args: Annot
     model = COLLECTIONS.get(collection)
     if not model:
         raise HTTPException(404, "Unknown collection")
-    return paginate(db, model, select(model).where(model.run_id == run_id), args)
+    query = select(model).where(model.run_id == run_id)
+    if collection == "subdomains":
+        query = query.where(m.Finding.kind == "subdomain")
+    return paginate(db, model, query, args)
 
 
 @router.get("/screenshots/{screenshot_id}/content")

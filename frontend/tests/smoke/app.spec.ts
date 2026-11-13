@@ -47,7 +47,7 @@ test('completed local lab results expose paginated services and private captures
   await page.getByRole('button',{name:'Sign in',exact:true}).click()
   await expect(page).toHaveURL(/\/scans$/)
   await page.goto(process.env.SMOKE_RUN_PATH!)
-  await expect(page.getByRole('heading',{name:'Run overview.'})).toBeVisible()
+  await expect(page.getByRole('heading',{name:'Network scan results.'})).toBeVisible()
   await page.getByRole('button',{name:'Services',exact:true}).click()
   await expect(page.getByRole('columnheader',{name:'Product',exact:true})).toBeVisible()
   await expect(page.getByRole('cell',{name:'8000',exact:true})).toBeVisible()

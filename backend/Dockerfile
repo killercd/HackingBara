@@ -16,10 +16,14 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-acc
 FROM rust:1.85-bookworm AS rustscan
 RUN cargo install rustscan --version 2.4.1 --locked
 
+FROM golang:1.23-bookworm AS gobuster
+RUN CGO_ENABLED=0 go install github.com/OJ/gobuster/v3@v3.6.0
+
 FROM runtime AS scanner-tools
 RUN apt-get update && apt-get install -y --no-install-recommends nmap chromium chromium-driver git xvfb ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=rustscan /usr/local/cargo/bin/rustscan /usr/local/bin/rustscan
+COPY --from=gobuster /go/bin/gobuster /usr/local/bin/gobuster
 ARG EYEWITNESS_REV=c3286fb71406e0b55b85a7c38dac76ee50b0f955
 RUN git init /opt/eyewitness && cd /opt/eyewitness && git remote add origin https://github.com/RedSiege/EyeWitness.git \
     && git fetch --depth 1 origin "$EYEWITNESS_REV" && git checkout FETCH_HEAD \

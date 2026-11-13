@@ -21,7 +21,7 @@ async function load(quiet=false){const current=++version;if(!quiet)loading.value
 function remember(){void router.replace({query:{...route.query,[key('page')]:String(page.value),[key('size')]:String(size.value),[key('search')]:search.value,[key('status')]:status.value,[key('sort')]:sort.value,[key('order')]:order.value}})}
 function searchChanged(){page.value=1;remember();void load()}
 watch(()=>props.endpoint,()=>{page.value=1;void load()},{immediate:true})
-watch(()=>props.refresh,()=>{if(timer)clearInterval(timer);if(props.refresh)timer=setInterval(()=>void load(true),props.refresh)},{immediate:true})
+watch(()=>props.refresh,(refresh,previous)=>{if(timer)clearInterval(timer);if(refresh)timer=setInterval(()=>void load(true),refresh);else if(previous)void load(true)},{immediate:true})
 onUnmounted(()=>{version++;if(timer)clearInterval(timer)})
 defineExpose({load})
 function display(value:unknown){if(value===null||value===undefined||value==='')return '—';return typeof value==='object'?JSON.stringify(value):String(value)}

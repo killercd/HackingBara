@@ -1,6 +1,7 @@
 import ipaddress
 import re
 import socket
+from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -70,10 +71,64 @@ def normalize_url(value: str) -> str:
     return urlunsplit((u.scheme, authority, u.path or "/", u.query, ""))
 
 
+def dns_name(value: str, *, dns_labels=False) -> str:
+    value = value.strip().rstrip(".").encode("idna").decode().lower()
+    allowed_name = r"(?=.{1,253}$)[a-z0-9_.-]+" if dns_labels else r"(?=.{1,253}$)[a-z0-9.-]+"
+    if not re.fullmatch(allowed_name, value):
+        raise ValueError("Invalid DNS name")
+    label_pattern = r"[a-z0-9_-]{1,63}" if dns_labels else r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    if any(not re.fullmatch(label_pattern, label) for label in value.split(".")):
+        raise ValueError("Invalid DNS label")
+    return value
+
+
+class WordlistImport(BaseModel):
+    skipped_invalid: int = Field(default=0, ge=0)
+    skipped_comments: int = Field(default=0, ge=0)
+    duplicates: int = Field(default=0, ge=0)
+    examples: list[str] = Field(default_factory=list, max_length=5)
+
+
+def import_wordlist(content: str, domain: str):
+    """Keep valid candidates without letting one malformed row reject an entire file."""
+    report = WordlistImport()
+    words = {}
+    domain = dns_name(domain)
+    for number, line in enumerate(content.splitlines(), 1):
+        value = line.strip().lstrip("\ufeff")
+        if not value:
+            continue
+        if value.startswith(("#", ";", "//")):
+            report.skipped_comments += 1
+            continue
+        try:
+            value = dns_name(value, dns_labels=True)
+            if value.endswith(f".{domain}"):
+                value = value[: -(len(domain) + 1)]
+            elif value == domain:
+                raise ValueError("Base domain is not a subdomain")
+            if len(f"{value}.{domain}") > 253:
+                raise ValueError("Candidate exceeds the DNS name length limit")
+        except ValueError as exc:
+            report.skipped_invalid += 1
+            if len(report.examples) < 5:
+                report.examples.append(f"Line {number}: {line[:80]!r} — {exc}")
+            continue
+        if value in words:
+            report.duplicates += 1
+        words[value] = None
+    return list(words), report
+
+
 class ScanInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=5000)
+    mode: Literal["network", "subdomain"] = "network"
+    domain: str = Field(default="", max_length=253)
+    wordlist_filename: str = Field(default="", max_length=200)
+    wordlist_import: WordlistImport | None = None
+    subdomains: list[str] = Field(default_factory=list)
     targets: list[str] = Field(default_factory=list, max_length=256)
     ports: str = ""
     urls: list[str] = Field(default_factory=list, max_length=256)
@@ -81,7 +136,39 @@ class ScanInput(BaseModel):
     password_spray: bool = False
     credential_endpoints: list[str] = Field(default_factory=list, max_length=10)
     screenshots: bool = False
-    timeout: int = Field(default=120, ge=5, le=600)
+    # Retained for old configurations; no longer used as a scanner deadline.
+    timeout: int = Field(default=120, ge=5, le=600, exclude=True)
+    request_timeout: float = Field(default=2, ge=0.001, le=300, allow_inf_nan=False)
+    max_threads: int = Field(default=10, ge=1, le=1024)
+    network_timing: int = Field(default=3, ge=0, le=5)
+
+    @field_validator("domain")
+    @classmethod
+    def clean_domain(cls, value):
+        if not value.strip():
+            return ""
+        value = dns_name(value)
+        if "." not in value:
+            raise ValueError("Provide a fully qualified base domain")
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            return value
+        raise ValueError("Provide a domain, not an IP address")
+
+    @field_validator("subdomains")
+    @classmethod
+    def clean_subdomains(cls, values):
+        result = {}
+        for number, value in enumerate(values, 1):
+            try:
+                result[dns_name(value, dns_labels=True)] = None
+            except ValueError:
+                raise ValueError(
+                    f"Invalid wordlist entry at line {number}: {value[:80]!r}. "
+                    "Use relative names such as www or dev.api, without URLs or wildcards."
+                ) from None
+        return list(result)
 
     @field_validator("name")
     @classmethod
@@ -125,6 +212,21 @@ class ScanInput(BaseModel):
     def check_options(self):
         # Validate defaults too, since validators normally skip default values.
         self.ports = ports(self.ports)
+        if self.mode == "subdomain":
+            if not self.domain or not self.subdomains:
+                raise ValueError("Subdomain scans require a base domain and a subdomain wordlist")
+            if any(len(f"{word}.{self.domain}") > 253 for word in self.subdomains):
+                raise ValueError("Subdomain exceeds the DNS name length limit")
+            if (
+                self.targets
+                or self.urls
+                or self.credential_ids
+                or self.password_spray
+                or self.credential_endpoints
+                or self.screenshots
+            ):
+                raise ValueError("Subdomain mode supports DNS enumeration only")
+            return self
         if not self.targets and not self.urls:
             raise ValueError("Provide at least one IP/CIDR target or HTTP(S) URL")
         if len(set(self.credential_ids)) != len(self.credential_ids):
@@ -194,6 +296,8 @@ class ScopePreparationError(ValueError):
 
 def prepare_run_config(config: ScanInput, resolution_issues=None) -> ScanInput:
     """Freeze resolvable targets, report individual DNS failures, reject scope violations."""
+    if config.mode == "subdomain":
+        return config
     issues = resolution_issues if resolution_issues is not None else []
     scope = Scope(config.targets) if config.targets else None
     addresses = set()

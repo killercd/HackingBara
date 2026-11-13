@@ -191,8 +191,15 @@ class Runner:
                 finding(db, run, "new_port", f"{ip}:{port}/tcp", {"ip": ip, "port": port})
         db.commit()
 
-    def enumerate(self, db, run, ip, discovered, timeout):
-        observations, result, argv = scanners.nmap(ip, discovered, timeout, self.tick)
+    def enumerate(self, db, run, ip, discovered, config):
+        observations, result, argv = scanners.nmap(
+            ip,
+            discovered,
+            config.request_timeout,
+            self.tick,
+            max_threads=config.max_threads,
+            timing=config.network_timing,
+        )
         if result:
             self.tool_event(db, run, result, argv)
         for data in observations:
@@ -444,6 +451,66 @@ class Runner:
                     )
         db.commit()
 
+    def subdomains(self, db, run, config):
+        self.boundary(db, run, "dns")
+        target = get_or_create(
+            db,
+            m.RunTarget,
+            run_id=run.id,
+            identity=config.domain,
+            defaults={"target_type": "domain"},
+        )
+        # Progress counts completed wordlist candidates, including negative DNS answers.
+        run.total = len(config.subdomains)
+        db.commit()
+        latest = run.processed
+        last_save = 0.0
+
+        def publish(processed, observation=None, force=False):
+            nonlocal latest, last_save
+            latest = max(latest, processed)
+            if observation is not None:
+                finding(db, run, "subdomain", observation["hostname"], observation)
+            if force or observation is not None or time.monotonic() - last_save >= 0.5:
+                run.processed = min(latest, run.total)
+                db.flush()
+                count = db.scalar(
+                    select(func.count())
+                    .select_from(m.Finding)
+                    .where(
+                        m.Finding.run_id == run.id,
+                        m.Finding.kind == "subdomain",
+                    )
+                )
+                run.counts = {**run.counts, "subdomains": count}
+                db.commit()
+                last_save = time.monotonic()
+
+        if not self.checkpoint(db, run, "dns", config.domain):
+            try:
+                observations, result, argv = scanners.gobuster_dns(
+                    config.domain,
+                    config.subdomains,
+                    config.request_timeout,
+                    self.tick,
+                    max_threads=config.max_threads,
+                    on_update=publish,
+                )
+            except scanners.ToolError as exc:
+                target.status = "error"
+                self.error(db, run, config.domain, exc)
+                raise
+            finally:
+                # Also retain the last progress update when a stop interrupts the process.
+                publish(latest, force=True)
+            self.tool_event(db, run, result, argv)
+            for observation in observations:
+                finding(db, run, "subdomain", observation["hostname"], observation)
+            target.status = "completed"
+            self.done(db, run, "dns", config.domain)
+        run.processed = run.total
+        db.commit()
+
     def run(self):
         with SessionLocal() as db:
             run = db.get(m.Run, self.run_id)
@@ -454,60 +521,68 @@ class Runner:
             ).all()
             self.secret_values = [cipher().decrypt(c.encrypted_secret.encode()).decode() for c in selected]
             try:
-                self.boundary(db, run, "scope")
-                for address in scope.addresses():
-                    get_or_create(db, m.RunTarget, run_id=run.id, identity=address)
-                db.commit()
-                for target in db.scalars(
-                    select(m.RunTarget).where(m.RunTarget.run_id == run.id).order_by(m.RunTarget.identity)
-                ):
-                    address = target.identity
-                    self.boundary(db, run, "discovery")
-                    if not scope.allows(address):
-                        raise ValueError("Target outside scope")
-                    if not self.checkpoint(db, run, "discovery", address):
-                        try:
-                            found, result, argv = scanners.rustscan(
-                                address, config.ports, config.timeout, self.tick
-                            )
-                            self.tool_event(db, run, result, argv)
-                            self.persist_ports(db, run, address, found)
-                            target.status = "discovered"
-                        except scanners.Interrupted:
-                            raise
-                        except Exception as exc:
-                            target.status = "error"
-                            self.error(db, run, address, exc)
-                        self.done(db, run, "discovery", address)
-                    self.boundary(db, run, "enumeration")
-                    if not self.checkpoint(db, run, "enumeration", address):
-                        discovered = db.scalars(
-                            select(m.ServiceObservation.port).where(
-                                m.ServiceObservation.run_id == run.id, m.ServiceObservation.ip == address
-                            )
-                        ).all()
-                        try:
-                            self.enumerate(db, run, address, discovered, config.timeout)
-                            if target.status != "error":
-                                target.status = "completed"
-                        except scanners.Interrupted:
-                            raise
-                        except Exception as exc:
-                            target.status = "error"
-                            self.error(db, run, address, exc)
-                        self.done(db, run, "enumeration", address)
-                    run.processed = db.scalar(
-                        select(func.count())
-                        .select_from(m.Checkpoint)
-                        .where(m.Checkpoint.run_id == run.id, m.Checkpoint.stage == "enumeration")
-                    )
+                if config.mode == "subdomain":
+                    self.subdomains(db, run, config)
+                else:
+                    self.boundary(db, run, "scope")
+                    for address in scope.addresses():
+                        get_or_create(db, m.RunTarget, run_id=run.id, identity=address)
                     db.commit()
-                    self.summarize(db, run)
-                self.endpoints(db, run, config, scope)
-                self.credentials(db, run, config, scope)
-                self.screenshots(db, run, config, scope)
+                    for target in db.scalars(
+                        select(m.RunTarget).where(m.RunTarget.run_id == run.id).order_by(m.RunTarget.identity)
+                    ):
+                        address = target.identity
+                        self.boundary(db, run, "discovery")
+                        if not scope.allows(address):
+                            raise ValueError("Target outside scope")
+                        if not self.checkpoint(db, run, "discovery", address):
+                            try:
+                                found, result, argv = scanners.rustscan(
+                                    address,
+                                    config.ports,
+                                    config.request_timeout,
+                                    self.tick,
+                                    max_threads=config.max_threads,
+                                )
+                                self.tool_event(db, run, result, argv)
+                                self.persist_ports(db, run, address, found)
+                                target.status = "discovered"
+                            except scanners.Interrupted:
+                                raise
+                            except Exception as exc:
+                                target.status = "error"
+                                self.error(db, run, address, exc)
+                            self.done(db, run, "discovery", address)
+                        self.boundary(db, run, "enumeration")
+                        if not self.checkpoint(db, run, "enumeration", address):
+                            discovered = db.scalars(
+                                select(m.ServiceObservation.port).where(
+                                    m.ServiceObservation.run_id == run.id, m.ServiceObservation.ip == address
+                                )
+                            ).all()
+                            try:
+                                self.enumerate(db, run, address, discovered, config)
+                                if target.status != "error":
+                                    target.status = "completed"
+                            except scanners.Interrupted:
+                                raise
+                            except Exception as exc:
+                                target.status = "error"
+                                self.error(db, run, address, exc)
+                            self.done(db, run, "enumeration", address)
+                        run.processed = db.scalar(
+                            select(func.count())
+                            .select_from(m.Checkpoint)
+                            .where(m.Checkpoint.run_id == run.id, m.Checkpoint.stage == "enumeration")
+                        )
+                        db.commit()
+                        self.summarize(db, run)
+                    self.endpoints(db, run, config, scope)
+                    self.credentials(db, run, config, scope)
+                    self.screenshots(db, run, config, scope)
                 self.boundary(db, run, "consolidation")
-                self.consolidate(db, run)
+                if config.mode == "network":
+                    self.consolidate(db, run)
                 self.tick(True)
                 db.refresh(run, with_for_update=True)
                 if run.lease_owner != self.owner or run.status == "stopping":
@@ -553,6 +628,7 @@ class Runner:
     def summarize(db, run):
         counts = {}
         for name, model in (
+            ("subdomains", m.Finding),
             ("hosts", m.RunHost),
             ("open_ports", m.ServiceObservation),
             ("services", m.ServiceObservation),
@@ -563,7 +639,9 @@ class Runner:
             ("errors", m.Event),
         ):
             query = select(func.count()).select_from(model).where(model.run_id == run.id)
-            if name == "credentials":
+            if name == "subdomains":
+                query = query.where(m.Finding.kind == "subdomain")
+            elif name == "credentials":
                 query = query.where(m.Attempt.status == "successful")
             elif name == "screenshots":
                 query = query.where(m.Screenshot.status == "captured")

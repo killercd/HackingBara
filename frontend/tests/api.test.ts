@@ -17,6 +17,22 @@ describe('typed API boundary',()=>{
     expect(await api('/scans','POST',{name:'Lab'})).toEqual({id:'new'})
     expect(fetch.mock.calls[0][1]).toMatchObject({method:'POST',credentials:'same-origin',headers:{'X-CSRF-Token':'token'},body:'{"name":"Lab"}'})
   })
+  it('uploads FormData without overriding the multipart boundary',async()=>{
+    vi.stubGlobal('document',{cookie:'hb_csrf=token'})
+    const fetch=vi.fn().mockResolvedValue(new Response(JSON.stringify({id:'new'}),{status:201}))
+    vi.stubGlobal('fetch',fetch)
+    const body=new FormData()
+    body.append('config',JSON.stringify({name:'DNS'}))
+    body.append('wordlist',new Blob(['api\nwww']), 'words.txt')
+    await api('/scans','POST',body)
+    expect(fetch.mock.calls[0][1].body).toBe(body)
+    expect(fetch.mock.calls[0][1].headers).toEqual({'X-CSRF-Token':'token'})
+  })
+  it('explains a proxy upload limit even when the response is HTML',async()=>{
+    vi.stubGlobal('document',{cookie:''})
+    vi.stubGlobal('fetch',vi.fn().mockResolvedValue(new Response('<h1>413 Request Entity Too Large</h1>',{status:413})))
+    await expect(api('/scans','POST',{})).rejects.toThrow('Wordlist files must be at most 3 MiB')
+  })
   it('shows validation details and handles empty success responses',async()=>{
     vi.stubGlobal('document',{cookie:''})
     vi.stubGlobal('fetch',vi.fn().mockResolvedValue(new Response(JSON.stringify({error:{message:'Validation failed',details:[{field:'body.targets',message:'Invalid target'}]}}),{status:422})))
