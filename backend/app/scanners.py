@@ -1,6 +1,7 @@
 """Bounded subprocess adapters. Scanner output is always untrusted."""
 
 import ipaddress
+import json
 import os
 import re
 import selectors
@@ -15,7 +16,7 @@ from pathlib import Path
 from defusedxml import ElementTree
 
 from .config import settings
-from .scope import ScanInput, port_set
+from .scope import ScanInput, ScopePreparationError, port_set
 
 
 class Interrupted(Exception):
@@ -337,3 +338,18 @@ def gobuster_dns(domain, words, request_timeout, tick, max_threads=10, on_update
         observations = stream.finish()
         result.version = tool_version("gobuster", tick)
         return observations, result, argv
+
+
+def prepare_scope(config, tick):
+    # DNS resolution must not hold an HTTP request or a database transaction open.
+    # The process guard keeps heartbeat/stop effective even inside getaddrinfo().
+    with tempfile.TemporaryDirectory(prefix="prepare-scope-") as directory:
+        path = Path(directory) / "config.json"
+        path.write_text(config.model_dump_json())
+        result = run_tool([sys.executable, "-m", "app.prepare_scope", str(path)], None, tick)
+        if result.exit_code:
+            raise ToolError("Scope resolver process failed", {"stderr": result.stderr[:2000]})
+        data = json.loads(result.stdout)
+        if data.get("error"):
+            raise ScopePreparationError(data["error"], data["issues"])
+        return ScanInput.model_validate(data["config"]), data["issues"]

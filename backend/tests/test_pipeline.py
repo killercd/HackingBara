@@ -349,12 +349,14 @@ def test_url_only_run_derives_ips_without_mutating_definition(auth, db_factory, 
     assert scan["config"]["targets"] == []
     identity = launch(auth, scan)
     snapshot = auth.get(f"/api/v1/runs/{identity}").json()
-    assert snapshot["config_snapshot"]["targets"] == ["192.0.2.1"]
-    assert snapshot["total"] == 1
+    assert snapshot["config_snapshot"]["targets"] == []
+    assert snapshot["status"] == "queued"
     assert auth.get(f"/api/v1/scans/{scan['id']}").json()["config"]["targets"] == []
     Runner(identity, claim(identity)).run()
     result = auth.get(f"/api/v1/runs/{identity}").json()
     assert result["status"] == "completed"
+    assert result["config_snapshot"]["targets"] == ["192.0.2.1"]
+    assert result["total"] == 1
     assert result["counts"]["services"] == 1
     assert ("rustscan", "192.0.2.1", "80") in fake_tools
     assert auth.get(f"/api/v1/runs/{identity}/endpoints?search=lab.example").json()["total"] == 1
@@ -369,11 +371,16 @@ def test_explicit_ip_scope_still_restricts_urls(auth, monkeypatch):
         json={"name": "Restricted", "targets": ["192.0.2.1"], "urls": ["http://lab.example/"]},
     ).json()
     response = auth.post(f"/api/v1/scans/{scan['id']}/runs", json={"authorized_scope_confirmed": True})
-    assert response.status_code == 422
-    assert auth.get(f"/api/v1/scans/{scan['id']}/runs").json()["total"] == 0
+    assert response.status_code == 202
+    identity = response.json()["id"]
+    Runner(identity, claim(identity)).run()
+    result = auth.get(f"/api/v1/runs/{identity}").json()
+    assert result["status"] == "failed"
+    assert "outside the authorized scope" in result["error_summary"]
+    assert auth.get(f"/api/v1/runs/{identity}/hosts").json()["total"] == 0
 
 
-def test_unresolvable_url_only_run_is_rejected_without_queueing(auth, monkeypatch):
+def test_unresolvable_url_only_run_fails_in_scope_stage_without_scanning(auth, monkeypatch):
     import socket
 
     def no_dns(*a, **k):
@@ -382,8 +389,13 @@ def test_unresolvable_url_only_run_is_rejected_without_queueing(auth, monkeypatc
     monkeypatch.setattr(socket, "getaddrinfo", no_dns)
     scan = auth.post("/api/v1/scans", json={"name": "Unresolved", "urls": ["http://missing.example/"]}).json()
     response = auth.post(f"/api/v1/scans/{scan['id']}/runs", json={"authorized_scope_confirmed": True})
-    assert response.status_code == 422
-    assert auth.get(f"/api/v1/scans/{scan['id']}/runs").json()["total"] == 0
+    assert response.status_code == 202
+    identity = response.json()["id"]
+    Runner(identity, claim(identity)).run()
+    result = auth.get(f"/api/v1/runs/{identity}").json()
+    assert result["status"] == "failed"
+    assert "None of the supplied URLs" in result["error_summary"]
+    assert auth.get(f"/api/v1/runs/{identity}/hosts").json()["total"] == 0
 
 
 def test_dns_failures_are_partial_results_and_optional_modules_skip_failed_urls(
@@ -413,12 +425,6 @@ def test_dns_failures_are_partial_results_and_optional_modules_skip_failed_urls(
         },
     ).json()
     identity = launch(auth, scan)
-    initial = auth.get(f"/api/v1/runs/{identity}").json()
-    assert initial["config_snapshot"]["targets"] == ["192.0.2.1"]
-    assert initial["config_snapshot"]["urls"] == ["http://working.example/", "http://missing.example/"]
-    failed = auth.get(f"/api/v1/runs/{identity}/endpoints?status=error").json()["items"]
-    assert len(failed) == 1 and failed[0]["url"] == "http://missing.example/"
-    assert failed[0]["details"]["code"] == "dns_resolution_failed"
     captures = []
 
     def capture(scope, url, *args):
@@ -428,15 +434,25 @@ def test_dns_failures_are_partial_results_and_optional_modules_skip_failed_urls(
 
     monkeypatch.setattr(pipeline, "capture", capture)
     Runner(identity, claim(identity)).run()
+    initial = auth.get(f"/api/v1/runs/{identity}").json()
+    assert initial["config_snapshot"]["targets"] == ["192.0.2.1"]
+    assert initial["config_snapshot"]["urls"] == ["http://working.example/", "http://missing.example/"]
+    failed = [
+        item
+        for item in auth.get(f"/api/v1/runs/{identity}/endpoints?status=error").json()["items"]
+        if item["details"].get("code") == "dns_resolution_failed"
+    ]
+    assert len(failed) == 1 and failed[0]["url"] == "http://missing.example/"
+    assert failed[0]["details"]["code"] == "dns_resolution_failed"
     assert auth.get(f"/api/v1/runs/{identity}").json()["status"] == "completed"
-    assert len(captures) == 2
+    assert captures == ["http://working.example/"]
     assert auth.get(f"/api/v1/runs/{identity}/credentials").json()["total"] == 0
     assert auth.get(f"/api/v1/runs/{identity}/endpoints?search=missing.example").json()["total"] == 1
     events = auth.get(f"/api/v1/runs/{identity}/events?search=missing.example").json()
     assert events["total"] == 1 and events["items"][0]["event_type"] == "dns_resolution_failed"
 
 
-def test_all_dns_failures_report_every_url_and_do_not_queue(auth, monkeypatch):
+def test_all_dns_failures_report_every_url_in_failed_run(auth, monkeypatch):
     import socket
 
     def resolve(*args, **kwargs):
@@ -446,12 +462,15 @@ def test_all_dns_failures_report_every_url_and_do_not_queue(auth, monkeypatch):
     urls = ["https://missing-one.example/", "https://missing-two.example/"]
     scan = auth.post("/api/v1/scans", json={"name": "All unresolved", "urls": urls}).json()
     response = auth.post(f"/api/v1/scans/{scan['id']}/runs", json={"authorized_scope_confirmed": True})
-    assert response.status_code == 422
-    error = response.json()["error"]
-    assert "None of the supplied URLs" in error["message"]
-    assert [item["field"] for item in error["details"]] == urls
-    assert all("DNS" in item["message"] for item in error["details"])
-    assert auth.get(f"/api/v1/scans/{scan['id']}/runs").json()["total"] == 0
+    assert response.status_code == 202
+    identity = response.json()["id"]
+    Runner(identity, claim(identity)).run()
+    run = auth.get(f"/api/v1/runs/{identity}").json()
+    assert run["status"] == "failed"
+    assert "None of the supplied URLs" in run["error_summary"]
+    failed = auth.get(f"/api/v1/runs/{identity}/endpoints?status=error").json()["items"]
+    assert {item["url"] for item in failed} == set(urls)
+    assert all(item["details"]["code"] == "dns_resolution_failed" for item in failed)
 
 
 def test_out_of_scope_is_reported_separately_from_dns_failure(auth, monkeypatch):
@@ -463,10 +482,14 @@ def test_out_of_scope_is_reported_separately_from_dns_failure(auth, monkeypatch)
         json={"name": "Outside scope", "targets": ["192.0.2.1"], "urls": ["http://outside.example/"]},
     ).json()
     response = auth.post(f"/api/v1/scans/{scan['id']}/runs", json={"authorized_scope_confirmed": True})
-    assert response.status_code == 422
-    error = response.json()["error"]
-    assert "outside the authorized scope" in error["message"]
-    assert error["details"][0]["field"] == "http://outside.example/"
+    assert response.status_code == 202
+    identity = response.json()["id"]
+    Runner(identity, claim(identity)).run()
+    run = auth.get(f"/api/v1/runs/{identity}").json()
+    assert run["status"] == "failed"
+    assert "outside the authorized scope" in run["error_summary"]
+    assert auth.get(f"/api/v1/runs/{identity}/events?search=scope_rejected").json()["total"] == 1
+    assert auth.get(f"/api/v1/runs/{identity}/events?search=dns_resolution_failed").json()["total"] == 0
 
 
 def test_network_timing_settings_reach_both_tools(auth, scan, fake_tools, monkeypatch):
@@ -495,3 +518,207 @@ def test_network_timing_settings_reach_both_tools(auth, scan, fake_tools, monkey
     assert run["status"] == "completed" and run["counts"]["errors"] == 0
     assert "timeout" not in run["config_snapshot"]
     assert [call[0] for call in fake_tools] == ["rustscan", "nmap"]
+
+
+@pytest.mark.parametrize("target", ["web.example", "https://web.example/"])
+@pytest.mark.parametrize("fail_first", [False, True])
+def test_eyewitness_attempts_every_http_port_with_original_hostname(auth, monkeypatch, target, fail_first):
+    import socket
+
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("192.0.2.1", 80))])
+    response = auth.post(
+        "/api/v1/scans",
+        json={"name": "Multiple web ports", "urls": [target], "ports": "22,80,443,8080", "screenshots": True},
+    )
+    assert response.status_code == 201, response.text
+    scan = response.json()
+    assert "web.example" in scan["target_summary"]
+    captures = []
+
+    def rustscan(*args, **kwargs):
+        return [22, 80, 443, 8080], ToolResult("", "", 0, 0.1), ["rustscan"]
+
+    def nmap(*args, **kwargs):
+        observations = []
+        for port, name, details in [
+            (22, "ssh", {}),
+            (80, "http", {}),
+            (443, "http", {"tunnel": "ssl"}),
+            (8080, "http-proxy", {}),
+        ]:
+            observations.append(
+                {
+                    "port": port,
+                    "name": name,
+                    "details": details,
+                    "transport": "tcp",
+                    "state": "open",
+                    "product": "",
+                    "version": "",
+                    "banner": "",
+                    "confidence": 10,
+                }
+            )
+        return observations, ToolResult("", "", 0, 0.1), ["nmap"]
+
+    def capture(scope, url, *args):
+        assert scope.resolve(url)[0] == ["192.0.2.1"]
+        captures.append(url)
+        if fail_first and url == "http://web.example/":
+            raise RuntimeError("Mock capture failure on port 80")
+        return "mock.png", "mock-thumb.png", 320, 200
+
+    monkeypatch.setattr(scanners, "rustscan", rustscan)
+    monkeypatch.setattr(scanners, "nmap", nmap)
+    monkeypatch.setattr(pipeline, "capture", capture)
+    identity = launch(auth, scan)
+    Runner(identity, claim(identity)).run()
+    assert auth.get(f"/api/v1/runs/{identity}").json()["status"] == "completed"
+    assert set(captures) == {"http://web.example/", "https://web.example/", "http://web.example:8080/"}
+    assert len(captures) == 3
+    endpoints = auth.get(f"/api/v1/runs/{identity}/endpoints").json()
+    assert endpoints["total"] == 3
+    assert {item["port"] for item in endpoints["items"]} == {80, 443, 8080}
+    shots = auth.get(f"/api/v1/runs/{identity}/screenshots").json()
+    assert shots["total"] == 3
+    assert sum(row["status"] == "captured" for row in shots["items"]) == (2 if fail_first else 3)
+    snapshot = auth.get(f"/api/v1/runs/{identity}").json()["config_snapshot"]
+    assert snapshot["targets"] == ["192.0.2.1"]
+    if target == "web.example":
+        assert snapshot["hostnames"] == ["web.example"] and snapshot["urls"] == []
+
+
+def test_unresolvable_hostname_is_reported_without_creating_fake_http_endpoint(auth, monkeypatch, fake_tools):
+    import socket
+
+    def resolve(host, *a, **k):
+        if host == "missing.example":
+            raise socket.gaierror(socket.EAI_NONAME, "No IP address")
+        return [(2, 1, 6, "", ("192.0.2.1", 80))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    response = auth.post(
+        "/api/v1/scans",
+        json={"name": "Mixed names", "urls": ["working.example", "missing.example"], "ports": "80"},
+    )
+    assert response.status_code == 201, response.text
+    identity = launch(auth, response.json())
+    Runner(identity, claim(identity)).run()
+    run = auth.get(f"/api/v1/runs/{identity}").json()
+    assert run["status"] == "completed"
+    endpoints = auth.get(f"/api/v1/runs/{identity}/endpoints").json()["items"]
+    assert [item["url"] for item in endpoints] == ["http://working.example/"]
+    assert auth.get(f"/api/v1/runs/{identity}/events?search=missing.example").json()["total"] == 1
+
+
+def test_screenshot_uses_ip_where_nmap_identified_http_server(auth, monkeypatch):
+    import socket
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *a, **k: [(2, 1, 6, "", ("192.0.2.1", 80)), (2, 1, 6, "", ("192.0.2.2", 80))],
+    )
+    scan = auth.post(
+        "/api/v1/scans",
+        json={"name": "Multiple addresses", "urls": ["web.example"], "ports": "8080", "screenshots": True},
+    ).json()
+
+    def rust(address, *a, **k):
+        return ([8080] if address == "192.0.2.2" else []), ToolResult("", "", 0, 0.1), ["rustscan"]
+
+    def nmap(address, discovered, *a, **k):
+        if not discovered:
+            return [], None, []
+        return (
+            [
+                {
+                    "port": 8080,
+                    "name": "http-alt",
+                    "details": {},
+                    "product": "",
+                    "version": "",
+                    "banner": "",
+                    "confidence": 10,
+                }
+            ],
+            ToolResult("", "", 0, 0.1),
+            ["nmap"],
+        )
+
+    attempts = []
+
+    def capture(scope, url, *a):
+        attempts.append((url, scope.resolve(url)[0]))
+        return "mock.png", "mock-thumb.png", 320, 200
+
+    monkeypatch.setattr(scanners, "rustscan", rust)
+    monkeypatch.setattr(scanners, "nmap", nmap)
+    monkeypatch.setattr(pipeline, "capture", capture)
+    identity = launch(auth, scan)
+    Runner(identity, claim(identity)).run()
+    assert attempts == [("http://web.example:8080/", ["192.0.2.2"])]
+    assert auth.get(f"/api/v1/runs/{identity}/endpoints").json()["items"][0]["ip"] == "192.0.2.2"
+
+
+def test_launch_queues_without_waiting_for_hostname_resolution(auth, monkeypatch):
+    import socket
+
+    scan = auth.post(
+        "/api/v1/scans",
+        json={"name": "Imported DNS names", "urls": [f"name-{i}.example.test" for i in range(44)]},
+    ).json()
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: pytest.fail("Launch must not perform DNS"))
+    monkeypatch.setattr(
+        scanners, "prepare_scope", lambda *a: pytest.fail("HTTP must not wait for scope preparation")
+    )
+    identity = launch(auth, scan)
+    run = auth.get(f"/api/v1/runs/{identity}").json()
+    assert run["status"] == "queued" and run["current_stage"] == "scope"
+    assert run["config_snapshot"]["targets"] == []
+    assert len(run["config_snapshot"]["hostnames"]) == 44
+
+
+def test_stop_during_scope_preparation_does_not_start_scanners(auth, monkeypatch):
+    scan = auth.post("/api/v1/scans", json={"name": "Stop resolution", "urls": ["slow.example.test"]}).json()
+    identity = launch(auth, scan)
+
+    def prepare(config, tick):
+        run = auth.get(f"/api/v1/runs/{identity}").json()
+        assert run["status"] == "running" and run["current_stage"] == "scope"
+        assert auth.post(f"/api/v1/runs/{identity}/stop").status_code == 200
+        tick(True)
+        pytest.fail("Scope preparation must be interrupted")
+
+    monkeypatch.setattr(scanners, "prepare_scope", prepare)
+    monkeypatch.setattr(
+        scanners, "rustscan", lambda *a, **k: pytest.fail("No scanning before the IP scope is frozen")
+    )
+    Runner(identity, claim(identity)).run()
+    assert auth.get(f"/api/v1/runs/{identity}").json()["status"] == "stopped"
+    assert auth.get(f"/api/v1/runs/{identity}/hosts").json()["total"] == 0
+
+
+def test_prepared_scope_is_not_resolved_again_after_pause(auth, scan, fake_tools, monkeypatch):
+    calls = []
+    prepare = scanners.prepare_scope
+    rustscan = scanners.rustscan
+
+    def resolver(config, tick):
+        calls.append(1)
+        return prepare(config, tick)
+
+    def pause(*args, **options):
+        result = rustscan(*args, **options)
+        assert auth.post(f"/api/v1/runs/{identity}/pause").status_code == 200
+        return result
+
+    monkeypatch.setattr(scanners, "prepare_scope", resolver)
+    monkeypatch.setattr(scanners, "rustscan", pause)
+    identity = launch(auth, scan)
+    Runner(identity, claim(identity)).run()
+    assert auth.get(f"/api/v1/runs/{identity}").json()["status"] == "paused"
+    assert auth.post(f"/api/v1/runs/{identity}/resume").status_code == 200
+    Runner(identity, claim(identity)).run()
+    assert auth.get(f"/api/v1/runs/{identity}").json()["status"] == "completed"
+    assert calls == [1]

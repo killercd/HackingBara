@@ -3,7 +3,6 @@ import math
 import shutil
 from datetime import datetime, timedelta
 from typing import Annotated
-from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
@@ -16,7 +15,7 @@ from starlette.datastructures import UploadFile
 from . import models as m
 from .config import settings
 from .db import get_db, now
-from .scope import ScanInput, Scope, ScopePreparationError, import_wordlist, prepare_run_config
+from .scope import ScanInput, Scope, import_wordlist
 from .security import DUMMY_HASH, cipher, create_session, current_user, digest, verify
 
 router = APIRouter(prefix="/api/v1")
@@ -234,7 +233,7 @@ def save_scan(db, scan, body):
     scan.target_summary = (
         f"{body.domain} ({len(body.subdomains)} DNS candidates)"
         if body.mode == "subdomain"
-        else ", ".join(body.targets + body.urls)
+        else ", ".join(body.targets + body.hostnames + body.urls)
     )
     db.add(scan)
     db.flush()
@@ -371,21 +370,6 @@ def start_run(scan_id: str, body: Launch, user: User, db: DB):
     ):
         raise HTTPException(429, "Run queue is full")
     config = ScanInput.model_validate(scan.config)
-    resolution_issues = []
-    try:
-        config = prepare_run_config(config, resolution_issues)
-    except ScopePreparationError as exc:
-        raise HTTPException(
-            422,
-            {
-                "message": str(exc),
-                "details": [{"field": issue["url"], "message": issue["message"]} for issue in exc.issues],
-            },
-        ) from None
-    except (ValueError, OSError):
-        raise HTTPException(
-            422, "URL scope preparation failed; check the supplied targets and DNS configuration"
-        ) from None
     run = m.Run(
         scan_id=scan_id,
         config_snapshot=config.model_dump(),
@@ -399,38 +383,6 @@ def start_run(scan_id: str, body: Launch, user: User, db: DB):
     scan.last_run_at, scan.last_status = run.created_at, "queued"
     for credential_id in config.credential_ids:
         db.add(m.RunCredential(run_id=run.id, credential_id=credential_id))
-    if resolution_issues:
-        from .pipeline import get_or_create
-
-        for issue in resolution_issues:
-            url = issue["url"]
-            endpoint = get_or_create(db, m.Endpoint, url=url)
-            parsed = urlsplit(url)
-            db.add(
-                m.EndpointObservation(
-                    run_id=run.id,
-                    endpoint_id=endpoint.id,
-                    url=url,
-                    ip="",
-                    port=parsed.port or (443 if parsed.scheme == "https" else 80),
-                    source="explicit",
-                    status="error",
-                    details={"error": issue["message"], "code": issue["code"]},
-                )
-            )
-            db.add(m.Checkpoint(run_id=run.id, stage="endpoints", target_key=url, state="error"))
-            db.add(
-                m.Event(
-                    run_id=run.id,
-                    stage="scope",
-                    event_type=issue["code"],
-                    level="error",
-                    message=f"Skipped {url}: {issue['message']}",
-                    details=issue,
-                )
-            )
-            db.add(m.Finding(run_id=run.id, kind="scanner_error", identity=f"scope:{url}", evidence=issue))
-        run.counts = {"errors": len(resolution_issues), "endpoints": len(resolution_issues)}
     audit(db, run, user, "start")
     db.commit()
     # The independent scheduler publishes this durable outbox row.
@@ -440,6 +392,43 @@ def start_run(scan_id: str, body: Launch, user: User, db: DB):
 @router.get("/runs/{run_id}")
 def run_detail(run_id: str, user: User, db: DB):
     return serialize(get_or_404(db, m.Run, run_id))
+
+
+@router.get("/runs/{run_id}/network-draft")
+def network_draft(run_id: str, user: User, db: DB):
+    run = get_or_404(db, m.Run, run_id)
+    if run.config_snapshot.get("mode") != "subdomain":
+        raise HTTPException(422, "Only DNS recon results can be used for this action")
+    # Query the full run, independently of pagination and filters in the results table.
+    names = db.scalars(
+        select(m.Finding.identity)
+        .where(
+            m.Finding.run_id == run.id,
+            m.Finding.kind == "subdomain",
+        )
+        .distinct()
+        .order_by(m.Finding.identity)
+    ).all()
+    if not names:
+        raise HTTPException(422, "This DNS run has no discovered subdomains")
+    domain = run.config_snapshot["domain"]
+    return {
+        "config": {
+            "mode": "network",
+            "name": f"Network - {domain}"[:200],
+            "description": f"Discovered subdomains from DNS run {run.id} ({domain}).",
+            "targets": [],
+            "hostnames": [],
+            "urls": list(names),
+        },
+        "source": {
+            "run_id": run.id,
+            "scan_id": run.scan_id,
+            "domain": domain,
+            "status": run.status,
+            "target_count": len(names),
+        },
+    }
 
 
 @router.post("/runs/{run_id}/{action}")

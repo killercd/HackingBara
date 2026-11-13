@@ -12,7 +12,7 @@ from .capture import capture
 from .config import settings
 from .db import SessionLocal, now
 from .network import basic_auth
-from .scope import ScanInput, Scope, normalize_url
+from .scope import EndpointScope, ScanInput, Scope, ScopePreparationError, hostname_url, normalize_url
 from .security import cipher
 
 TERMINAL = ("completed", "failed", "stopped")
@@ -249,20 +249,50 @@ class Runner:
         db.commit()
 
     def endpoints(self, db, run, config, scope):
-        urls = {u: ("explicit", None) for u in config.urls}
-        for service in db.scalars(select(m.ServiceObservation).where(m.ServiceObservation.run_id == run.id)):
-            if "http" not in service.name:
+        urls = {u: ("explicit", None, None) for u in config.urls}
+        # Keep the supplied names for virtual hosting and TLS SNI on every HTTP port.
+        names = list(dict.fromkeys(config.hostnames + [urlsplit(url).hostname for url in config.urls]))
+        aliases = defaultdict(list)
+        for name in names:
+            if self.checkpoint(db, run, "hostname_resolution", name):
                 continue
-            scheme = "https" if service.details.get("tunnel") == "ssl" or "https" in service.name else "http"
-            host = f"[{service.ip}]" if ":" in service.ip else service.ip
-            url = normalize_url(f"{scheme}://{host}:{service.port}/")
-            urls.setdefault(url, ("nmap", service.service_id))
-        for url, (source, service_id) in urls.items():
+            self.boundary(db, run, "endpoints")
+            try:
+                addresses, _ = scope.resolve(hostname_url(name))
+                for address in addresses:
+                    aliases[address].append(name)
+            except (ValueError, OSError) as exc:
+                if name in config.hostnames:
+                    self.error(db, run, f"Hostname scope rejected: {name}", exc)
+        for service in db.scalars(
+            select(m.ServiceObservation)
+            .where(
+                m.ServiceObservation.run_id == run.id,
+                m.ServiceObservation.state == "open",
+            )
+            .order_by(m.ServiceObservation.ip, m.ServiceObservation.port)
+        ):
+            name = service.name.lower()
+            if "http" not in name:
+                continue
+            scheme = (
+                "https"
+                if service.details.get("tunnel") == "ssl" or "https" in name or name.startswith("ssl/")
+                else "http"
+            )
+            for hostname in aliases.get(service.ip, [service.ip]):
+                host = f"[{hostname}]" if ":" in hostname else hostname
+                url = normalize_url(f"{scheme}://{host}:{service.port}/")
+                source, existing_service, preferred_ip = urls.get(url, ("nmap", None, None))
+                urls[url] = (source, existing_service or service.service_id, preferred_ip or service.ip)
+        for url, (source, service_id, preferred_ip) in urls.items():
             self.boundary(db, run, "endpoints")
             if self.checkpoint(db, run, "endpoints", url):
                 continue
             try:
                 addresses, port = scope.resolve(url)
+                if preferred_ip is not None and preferred_ip not in addresses:
+                    raise ValueError("HTTP service hostname no longer resolves to the observed address")
                 endpoint = get_or_create(db, m.Endpoint, url=url, defaults={"service_id": service_id})
                 endpoint.last_seen_at = now()
                 get_or_create(
@@ -270,7 +300,7 @@ class Runner:
                     m.EndpointObservation,
                     run_id=run.id,
                     endpoint_id=endpoint.id,
-                    defaults={"url": url, "ip": addresses[0], "port": port, "source": source},
+                    defaults={"url": url, "ip": preferred_ip or addresses[0], "port": port, "source": source},
                 )
             except (ValueError, OSError) as exc:
                 self.error(db, run, "Endpoint scope rejected", exc)
@@ -390,7 +420,7 @@ class Runner:
             db.commit()
             try:
                 shot.path, shot.thumbnail_path, shot.width, shot.height = capture(
-                    scope, endpoint.url, run.id, shot.id, self.tick
+                    EndpointScope(scope, endpoint.ip), endpoint.url, run.id, shot.id, self.tick
                 )
                 shot.status, shot.captured_at = "captured", now()
                 endpoint.status = "captured"
@@ -450,6 +480,82 @@ class Runner:
                         defaults={"ip": old.ip, "status": "no-longer-observed"},
                     )
         db.commit()
+
+    def resolution_issues(self, db, run, issues):
+        for issue in issues:
+            url = issue["url"]
+            if issue.get("hostname"):
+                get_or_create(
+                    db,
+                    m.Checkpoint,
+                    run_id=run.id,
+                    stage="hostname_resolution",
+                    target_key=issue["hostname"],
+                    defaults={"state": "error"},
+                )
+            else:
+                endpoint = get_or_create(db, m.Endpoint, url=url)
+                parsed = urlsplit(url)
+                get_or_create(
+                    db,
+                    m.EndpointObservation,
+                    run_id=run.id,
+                    endpoint_id=endpoint.id,
+                    defaults={
+                        "url": url,
+                        "ip": "",
+                        "port": parsed.port or (443 if parsed.scheme == "https" else 80),
+                        "source": "explicit",
+                        "status": "error",
+                        "details": {"error": issue["message"], "code": issue["code"]},
+                    },
+                )
+                get_or_create(
+                    db,
+                    m.Checkpoint,
+                    run_id=run.id,
+                    stage="endpoints",
+                    target_key=url,
+                    defaults={"state": "error"},
+                )
+            event(
+                db,
+                run,
+                issue["code"],
+                f"Skipped {issue.get('hostname', url)}: {issue['message']}",
+                "error",
+                issue,
+            )
+            finding(db, run, "scanner_error", f"scope:{url}", issue)
+        db.commit()
+        self.summarize(db, run)
+
+    def prepare_scope(self, db, run, config):
+        self.boundary(db, run, "scope")
+        if self.checkpoint(db, run, "scope", "prepared"):
+            return config
+        event(
+            db,
+            run,
+            "scope_preparing",
+            "Resolving hostnames and freezing the authorized IP scope",
+            details={"hostnames": len(config.hostnames), "urls": len(config.urls)},
+        )
+        db.commit()
+        # Release read transactions as well: DNS must not monopolize a database connection.
+        try:
+            prepared, issues = scanners.prepare_scope(config, self.tick)
+        except ScopePreparationError as exc:
+            self.resolution_issues(db, run, exc.issues)
+            raise
+        self.tick(True)
+        db.refresh(run)
+        run.config_snapshot = prepared.model_dump()
+        run.total = len(Scope(prepared.targets).addresses())
+        event(db, run, "scope_prepared", "Authorized IP scope prepared", details={"addresses": run.total})
+        self.resolution_issues(db, run, issues)
+        self.done(db, run, "scope", "prepared")
+        return prepared
 
     def subdomains(self, db, run, config):
         self.boundary(db, run, "dns")
@@ -524,7 +630,8 @@ class Runner:
                 if config.mode == "subdomain":
                     self.subdomains(db, run, config)
                 else:
-                    self.boundary(db, run, "scope")
+                    config = self.prepare_scope(db, run, config)
+                    scope = Scope(config.targets)
                     for address in scope.addresses():
                         get_or_create(db, m.RunTarget, run_id=run.id, identity=address)
                     db.commit()
@@ -618,7 +725,11 @@ class Runner:
                 db.refresh(run)
                 if run.lease_owner == self.owner:
                     run.status, run.ended_at, run.lease_owner = "failed", now(), None
-                    run.error_summary = f"Execution failed: {type(exc).__name__}"
+                    run.error_summary = (
+                        str(exc)
+                        if isinstance(exc, ScopePreparationError)
+                        else f"Execution failed: {type(exc).__name__}"
+                    )
                     db.get(m.Scan, run.scan_id).last_status = "failed"
                     event(db, run, "failed", run.error_summary, "error")
                     self.summarize(db, run)

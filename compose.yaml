@@ -53,7 +53,7 @@ services:
       postgres: {condition: service_healthy}
   api:
     <<: *app
-    # Launch-time URL resolution needs external DNS; no API host port is published.
+    # No API host port is published; target DNS resolution runs in the worker.
     networks: [control, edge]
     volumes: [evidence:/evidence:ro]
     depends_on:

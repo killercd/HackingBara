@@ -35,12 +35,16 @@ const filters: Record<string, string[]> = {
   findings: ['subdomain', 'scanner_error'],
   events: ['info', 'warning', 'error'],
 }
+function createNetworkScan(){
+  void router.push({path:'/scans/new',query:{from_dns_run:props.run.id}})
+}
 const refresh = computed(() => ['queued', 'running', 'pausing', 'stopping'].includes(props.run.status) ? 1500 : 0)
 </script>
 
 <template>
   <section class="panel" aria-label="DNS scan scope">
     <h2>DNS enumeration</h2>
+    <div class="actions"><button type="button" :disabled="!run.counts.subdomains" @click="createNetworkScan">Create Network scan</button><span class="muted">Use all discovered subdomains as Network targets.</span></div>
     <p class="mono">{{run.config_snapshot.domain}}</p>
     <p class="muted">Gobuster DNS · {{run.config_snapshot.subdomains.length.toLocaleString()}} names in the selected wordlist</p>
     <p class="muted">{{run.config_snapshot.request_timeout ?? 2}} s per DNS lookup · {{run.config_snapshot.max_threads ?? 10}} threads · No total duration limit</p>

@@ -32,6 +32,17 @@ def db_factory(monkeypatch, tmp_path):
     factory = sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(database, "SessionLocal", factory)
     monkeypatch.setattr(pipeline, "SessionLocal", factory)
+    # Keep DNS mocks in process for pipeline tests; the resolver subprocess adapter
+    # is exercised separately with literal-IP input.
+    from app import scanners
+    from app.scope import prepare_run_config
+
+    def prepare_scope(config, tick):
+        tick(True)
+        issues = []
+        return prepare_run_config(config, issues), issues
+
+    monkeypatch.setattr(scanners, "prepare_scope", prepare_scope)
     import app.tasks as tasks
 
     monkeypatch.setattr(tasks, "SessionLocal", factory)

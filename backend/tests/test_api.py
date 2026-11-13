@@ -14,6 +14,7 @@ from app.db import now
         "/credentials",
         "/runs/anything",
         "/runs/anything/events",
+        "/runs/anything/network-draft",
         "/screenshots/anything/content",
         "/openapi.json",
         "/docs",

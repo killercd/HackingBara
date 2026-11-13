@@ -164,3 +164,87 @@ test('DNS progress and positive results update while running and remain after st
   await expect(page.getByRole('cell',{name:'www.example.test',exact:true})).toBeVisible()
   await expect(page.getByRole('cell',{name:'api.example.test',exact:true})).toBeVisible()
 })
+
+
+test('Network scan saves and restores a hostname without a URL scheme', async ({page}) => {
+  let config:Record<string,any>|undefined
+  await page.route('**/api/v1/**',async route=>{
+    const path=new URL(route.request().url()).pathname
+    let json:unknown={items:[],total:0,total_pages:0}
+    if(path.endsWith('/auth/me'))json={username:'operator'}
+    else if(path.endsWith('/scans')&&route.request().method()==='POST'){
+      const body=route.request().postDataJSON()
+      expect(body.urls).toEqual(['web.example'])
+      expect(body.screenshots).toBe(true)
+      expect(body.ports).toBe('80,443,8080')
+      config={...body,urls:[],hostnames:['web.example']}
+      json={id:'hostname-scan'}
+    }else if(path.endsWith('/scans/hostname-scan'))json={id:'hostname-scan',name:config?.name,config,target_summary:'web.example'}
+    await route.fulfill({json})
+  })
+  await page.goto('/scans/new')
+  await page.getByLabel('Scan name').fill('Hostname web ports')
+  await page.getByLabel('Hostnames or HTTP(S) URLs').fill('web.example')
+  await page.getByLabel('TCP ports').fill('80,443,8080')
+  await page.getByLabel('Capture screenshots with EyeWitness').check()
+  await page.getByRole('button',{name:'Save scan',exact:true}).click()
+  await expect(page.getByRole('heading',{name:'Hostname web ports',exact:true})).toBeVisible()
+  await page.getByRole('link',{name:'Edit configuration'}).click()
+  await expect(page.getByLabel('Hostnames or HTTP(S) URLs')).toHaveValue('web.example')
+  await expect(page.getByLabel('TCP ports')).toHaveValue('80,443,8080')
+  await expect(page.getByLabel('Capture screenshots with EyeWitness')).toBeChecked()
+})
+
+
+test('DNS results prefill a Network scan with all names independently of table filters', async ({page}) => {
+  const names=['api.example.test',...Array.from({length:124},(_,index)=>`host-${index}.example.test`)]
+  let saved:Record<string,any>|undefined,saveCount=0
+  await page.route('**/api/v1/**',async route=>{
+    const path=new URL(route.request().url()).pathname
+    let json:unknown={items:[],total:0,total_pages:0}
+    if(path.endsWith('/auth/me'))json={username:'operator'}
+    else if(path.endsWith('/runs/source-dns'))json={id:'source-dns',status:'stopped',processed:125,total:5000,current_stage:'dns',counts:{subdomains:125},config_snapshot:{mode:'subdomain',domain:'example.test',subdomains:['api']}}
+    else if(path.endsWith('/runs/source-dns/subdomains'))json={items:[{id:'visible',identity:names[0],evidence:{addresses:['192.0.2.1']}}],total:1,total_pages:1}
+    else if(path.endsWith('/runs/source-dns/network-draft')){
+      expect(new URL(route.request().url()).search).toBe('')
+      json={config:{mode:'network',name:'Network - example.test',description:'From DNS results',targets:[],hostnames:[],urls:names},source:{scan_id:'dns-scan',run_id:'source-dns',domain:'example.test',status:'stopped',target_count:125}}
+    }else if(path.endsWith('/scans')&&route.request().method()==='POST'){
+      saveCount++
+      saved=route.request().postDataJSON()
+      expect(saved?.urls).toEqual(names)
+      expect(saved).toMatchObject({mode:'network',targets:[],ports:'80,443,8080',password_spray:false,credential_ids:[]})
+      json={id:'from-dns'}
+    }else if(path.endsWith('/scans/from-dns'))json={id:'from-dns',name:saved?.name,config:{...saved,hostnames:names,urls:[]},target_summary:'Imported DNS names'}
+    await route.fulfill({json})
+  })
+  await page.goto('/scans/dns-scan/runs/source-dns?tab=subdomains&subdomains_search=api')
+  await expect(page.getByRole('cell',{name:'api.example.test',exact:true})).toBeVisible()
+  await page.getByRole('button',{name:'Create Network scan',exact:true}).click()
+  await expect(page).toHaveURL(/\/scans\/new\?from_dns_run=source-dns$/)
+  await expect(page.getByRole('region',{name:'Imported DNS results'})).toContainText('125 discovered subdomains imported')
+  await expect(page.getByLabel('Scan mode')).toHaveValue('network')
+  await expect(page.getByLabel('Hostnames or HTTP(S) URLs')).toHaveValue(names.join('\n'))
+  await expect(page.getByLabel('Authorized IP addresses / CIDRs')).toHaveValue('')
+  expect(saveCount).toBe(0)
+  await page.reload()
+  await expect(page.getByLabel('Hostnames or HTTP(S) URLs')).toHaveValue(names.join('\n'))
+  await page.getByLabel('TCP ports').fill('80,443,8080')
+  await page.getByRole('button',{name:'Save scan',exact:true}).click()
+  await expect(page.getByRole('heading',{name:'Network - example.test',exact:true})).toBeVisible()
+  expect(saveCount).toBe(1)
+})
+
+
+test('Network scope preparation is shown while DNS resolution runs in the worker', async ({page}) => {
+  await page.route('**/api/v1/**',async route=>{
+    const path=new URL(route.request().url()).pathname
+    const json=path.endsWith('/auth/me')?{username:'operator'}:path.endsWith('/runs/preparing')?
+      {id:'preparing',status:'running',current_stage:'scope',processed:0,total:0,counts:{},config_snapshot:{mode:'network',targets:[],hostnames:['slow.example.test'],urls:[]}}:
+      {items:[],total:0,total_pages:0}
+    await route.fulfill({json})
+  })
+  await page.goto('/scans/network/runs/preparing')
+  await expect(page.getByRole('status').filter({hasText:'Resolving hostnames'})).toBeVisible()
+  await expect(page.getByRole('progressbar',{name:'DNS scope preparation'})).not.toHaveAttribute('value')
+  await expect(page.getByRole('button',{name:'Stop',exact:true})).toBeVisible()
+})

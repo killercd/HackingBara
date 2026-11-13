@@ -358,3 +358,62 @@ def test_dns_stream_rejects_out_of_scope_and_incomplete_output():
         stream.feed(b"Missed: api.other.test\n")
     with pytest.raises(ToolError, match="every wordlist"):
         stream.finish()
+
+
+@pytest.mark.parametrize("source_status", ["completed", "stopped", "running"])
+def test_network_draft_contains_all_positive_results_and_saves_without_starting(
+    auth, db_factory, source_status
+):
+    from sqlalchemy import func, select
+
+    from app import models as m
+
+    _, identity = create_dns_run(auth)
+    names = sorted(
+        [f"host-{index:03d}.example.test" for index in range(300)]
+        + ["default._bimi.example.test", "node-.example.test"]
+    )
+    with db_factory() as db:
+        db.get(m.Run, identity).status = source_status
+        db.add_all(
+            m.Finding(
+                run_id=identity,
+                kind="subdomain",
+                identity=name,
+                evidence={"hostname": name, "addresses": ["192.0.2.1"]},
+            )
+            for name in names
+        )
+        db.add(m.Finding(run_id=identity, kind="scanner_error", identity="dns:error", evidence={}))
+        db.commit()
+        original_count = db.scalar(select(func.count()).select_from(m.Scan))
+    response = auth.get(f"/api/v1/runs/{identity}/network-draft")
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["config"]["mode"] == "network"
+    assert data["config"]["urls"] == names
+    assert data["config"]["targets"] == []
+    assert data["source"]["target_count"] == 302
+    assert data["source"]["status"] == source_status
+    assert auth.get(f"/api/v1/runs/{identity}/subdomains?page_size=25").json()["total_pages"] > 1
+    with db_factory() as db:
+        assert db.scalar(select(func.count()).select_from(m.Scan)) == original_count
+    saved = auth.post("/api/v1/scans", json=data["config"])
+    assert saved.status_code == 201, saved.text
+    assert saved.json()["config"]["hostnames"] == names
+    assert saved.json()["config"]["urls"] == []
+    assert saved.json()["last_status"] == "never"
+    assert auth.get(f"/api/v1/scans/{saved.json()['id']}/runs").json()["total"] == 0
+    # DNS source, findings and current run are untouched by preparing/saving the new definition.
+    assert auth.get(f"/api/v1/runs/{identity}").json()["status"] == source_status
+    assert auth.get(f"/api/v1/runs/{identity}/subdomains").json()["total"] == 302
+
+
+def test_network_draft_rejects_empty_or_non_dns_runs(auth, scan):
+    _, identity = create_dns_run(auth)
+    response = auth.get(f"/api/v1/runs/{identity}/network-draft")
+    assert response.status_code == 422
+    assert "no discovered subdomains" in response.json()["error"]["message"]
+    run = auth.post(f"/api/v1/scans/{scan['id']}/runs", json={"authorized_scope_confirmed": True}).json()
+    assert auth.get(f"/api/v1/runs/{run['id']}/network-draft").status_code == 422
+    assert auth.get("/api/v1/runs/missing/network-draft").status_code == 404

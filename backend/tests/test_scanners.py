@@ -115,3 +115,13 @@ def test_streaming_stdout_is_delivered_before_process_exit_without_accumulating_
         run_tool([sys.executable, "-c", code], None, on_stdout=stream, capture_stdout=False)
     assert received and b"x" in received[0]
     assert time.monotonic() - start < 6
+
+
+def test_scope_resolver_child_process_prepares_literal_ip_input():
+    from app.scanners import prepare_scope
+    from app.scope import ScanInput
+
+    config = ScanInput(name="Resolver subprocess", targets=["192.0.2.1"], ports="80")
+    prepared, issues = prepare_scope(config, lambda: None)
+    assert prepared.targets == config.targets
+    assert prepared.ports == "80" and issues == []

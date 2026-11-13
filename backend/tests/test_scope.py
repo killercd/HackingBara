@@ -155,3 +155,61 @@ def test_dns_diagnostics_distinguish_temporary_failure(error, monkeypatch):
     message = caught.value.issues[0]["message"]
     assert ("temporarily unavailable" in message) == (error == socket.EAI_AGAIN)
     assert "Untrusted resolver detail" not in message
+
+
+def test_network_targets_accept_hostnames_without_schemes(monkeypatch):
+    from app.scope import prepare_run_config
+
+    config = ScanInput(
+        name="Names", urls=["LAB.EXAMPLE", "lab.example/", "lab.example:8080/path", "lab.example:443/login"]
+    )
+    assert config.hostnames == ["lab.example"]
+    assert config.urls == ["http://lab.example:8080/path", "https://lab.example/login"]
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("192.0.2.1", 80))])
+    prepared = prepare_run_config(config)
+    assert prepared.targets == ["192.0.2.1"]
+    assert prepared.hostnames == ["lab.example"]
+    assert config.targets == []
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "file:///etc/passwd",
+        "//evil.example",
+        "user:secret@example.test",
+        "example.test/#fragment",
+        "example.test\\@evil.example",
+        "example.test:0",
+    ],
+)
+def test_schemeless_input_does_not_accept_unsafe_urls(target):
+    with pytest.raises(ValueError):
+        ScanInput(name="Unsafe", urls=[target])
+
+
+def test_hostname_targets_cannot_expand_explicit_scope(monkeypatch):
+    from app.scope import prepare_run_config
+
+    config = ScanInput(name="Restricted", targets=["192.0.2.1"], urls=["lab.example"])
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("203.0.113.1", 80))])
+    with pytest.raises(ValueError, match="outside"):
+        prepare_run_config(config)
+
+
+def test_screenshot_scope_uses_observed_address_and_rejects_rebinding(monkeypatch):
+    from app.scope import EndpointScope
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *a, **k: [(2, 1, 6, "", ("192.0.2.1", 8080)), (2, 1, 6, "", ("192.0.2.2", 8080))],
+    )
+    scope = EndpointScope(Scope(["192.0.2.1", "192.0.2.2"]), "192.0.2.2")
+    assert scope.resolve("http://web.example:8080/") == (["192.0.2.2"], 8080)
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("192.0.2.1", 8080))])
+    with pytest.raises(ValueError, match="observed address"):
+        scope.resolve("http://web.example:8080/")
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("203.0.113.1", 8080))])
+    with pytest.raises(ValueError, match="outside"):
+        scope.resolve("http://web.example:8080/")

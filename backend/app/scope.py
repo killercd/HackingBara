@@ -60,15 +60,22 @@ def normalize_url(value: str) -> str:
         hostname = f"[{ip}]" if ip.version == 6 else str(ip)
     except ValueError:
         hostname = hostname.encode("idna").decode().lower().rstrip(".")
-        if not re.fullmatch(r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", hostname):
-            raise ValueError("Invalid hostname")
-        if any(not x or len(x) > 63 or x.startswith("-") or x.endswith("-") for x in hostname.split(".")):
+        # DNS recon may return labels containing underscores or terminal hyphens.
+        if len(hostname) > 253 or any(
+            not re.fullmatch(r"[a-z0-9_-]{1,63}", label) for label in hostname.split(".")
+        ):
             raise ValueError("Invalid hostname")
     port = u.port
     if port is not None and not 1 <= port <= 65535:
         raise ValueError("Invalid URL port")
     authority = hostname + (f":{port}" if port and port != (443 if u.scheme == "https" else 80) else "")
     return urlunsplit((u.scheme, authority, u.path or "/", u.query, ""))
+
+
+def hostname_url(hostname):
+    """A URL used only to reuse scope/DNS validation; it does not authorize an HTTP endpoint."""
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    return normalize_url(f"http://{host}/")
 
 
 def dns_name(value: str, *, dns_labels=False) -> str:
@@ -132,6 +139,7 @@ class ScanInput(BaseModel):
     targets: list[str] = Field(default_factory=list, max_length=256)
     ports: str = ""
     urls: list[str] = Field(default_factory=list, max_length=256)
+    hostnames: list[str] = Field(default_factory=list)
     credential_ids: list[str] = Field(default_factory=list, max_length=10)
     password_spray: bool = False
     credential_endpoints: list[str] = Field(default_factory=list, max_length=10)
@@ -141,6 +149,40 @@ class ScanInput(BaseModel):
     request_timeout: float = Field(default=2, ge=0.001, le=300, allow_inf_nan=False)
     max_threads: int = Field(default=10, ge=1, le=1024)
     network_timing: int = Field(default=3, ge=0, le=5)
+
+    @model_validator(mode="before")
+    @classmethod
+    def split_network_targets(cls, data):
+        if not isinstance(data, dict) or not isinstance(data.get("urls", []), list):
+            return data
+        hosts = data.get("hostnames", [])
+        if not isinstance(hosts, list):
+            return data
+        hosts = list(hosts)
+        urls = []
+        for value in data.get("urls", []):
+            if not isinstance(value, str) or "://" in value or value.startswith("//"):
+                urls.append(value)
+                continue
+            value = value.strip()
+            normalized = normalize_url("http://" + value)
+            parsed = urlsplit("//" + value)
+            if parsed.port is None and parsed.path in ("", "/") and not parsed.query:
+                hosts.append(urlsplit(normalized).hostname)
+            else:
+                urls.append(normalize_url("https://" + value) if parsed.port == 443 else normalized)
+        return {**data, "urls": urls, "hostnames": hosts}
+
+    @field_validator("hostnames")
+    @classmethod
+    def clean_hostnames(cls, values):
+        names = []
+        for value in values:
+            parsed = urlsplit(hostname_url(value.strip()))
+            if parsed.port is not None or parsed.path != "/" or parsed.query:
+                raise ValueError("Hostname targets must not contain a port, path or query")
+            names.append(parsed.hostname)
+        return list(dict.fromkeys(names))
 
     @field_validator("domain")
     @classmethod
@@ -219,6 +261,7 @@ class ScanInput(BaseModel):
                 raise ValueError("Subdomain exceeds the DNS name length limit")
             if (
                 self.targets
+                or self.hostnames
                 or self.urls
                 or self.credential_ids
                 or self.password_spray
@@ -227,15 +270,15 @@ class ScanInput(BaseModel):
             ):
                 raise ValueError("Subdomain mode supports DNS enumeration only")
             return self
-        if not self.targets and not self.urls:
-            raise ValueError("Provide at least one IP/CIDR target or HTTP(S) URL")
+        if not self.targets and not self.urls and not self.hostnames:
+            raise ValueError("Provide at least one IP/CIDR target, hostname or HTTP(S) URL")
         if len(set(self.credential_ids)) != len(self.credential_ids):
             raise ValueError("Duplicate credential references")
         if self.password_spray and (not self.credential_ids or not self.credential_endpoints):
             raise ValueError("Credential validation requires credentials and explicit endpoint approval")
         if any(url not in self.urls for url in self.credential_endpoints):
             raise ValueError("Approved credential endpoints must be explicit scan URLs")
-        for url in self.urls:
+        for url in self.urls + [hostname_url(host) for host in self.hostnames]:
             try:
                 ipaddress.ip_address(urlsplit(url).hostname)
             except ValueError:
@@ -264,6 +307,21 @@ class Scope:
         if any(not self.allows(ip) for ip in addresses):
             raise ValueError("URL resolves outside the authorized scope")
         return addresses, port
+
+
+class EndpointScope:
+    """Keep Host/SNI while connecting screenshots to the IP where the service was found."""
+
+    def __init__(self, scope, address):
+        if not scope.allows(address):
+            raise ValueError("Screenshot address outside scope")
+        self.scope, self.address = scope, address
+
+    def resolve(self, url):
+        addresses, port = self.scope.resolve(url)
+        if self.address not in addresses:
+            raise ValueError("Screenshot hostname no longer resolves to the observed address")
+        return [self.address], port
 
 
 def resolve_url_addresses(url):
@@ -301,7 +359,9 @@ def prepare_run_config(config: ScanInput, resolution_issues=None) -> ScanInput:
     issues = resolution_issues if resolution_issues is not None else []
     scope = Scope(config.targets) if config.targets else None
     addresses = set()
-    for url in config.urls:
+    candidates = [(url, None) for url in config.urls]
+    candidates += [(hostname_url(host), host) for host in config.hostnames]
+    for url, hostname in candidates:
         try:
             resolved, _ = scope.resolve(url) if scope else resolve_url_addresses(url)
         except (socket.gaierror, TimeoutError) as exc:
@@ -309,6 +369,7 @@ def prepare_run_config(config: ScanInput, resolution_issues=None) -> ScanInput:
             issues.append(
                 {
                     "url": url,
+                    **({"hostname": hostname} if hostname else {}),
                     "code": "dns_resolution_failed",
                     "message": "DNS resolver temporarily unavailable; retry later"
                     if temporary
@@ -336,7 +397,9 @@ def prepare_run_config(config: ScanInput, resolution_issues=None) -> ScanInput:
         return config
     if not addresses:
         raise ScopePreparationError(
-            "None of the supplied URLs could be resolved to an IP address. Check DNS records and try again.",
+            "None of the supplied hostnames or URLs could be resolved to an IP address. Check DNS records and try again."
+            if config.hostnames
+            else "None of the supplied URLs could be resolved to an IP address. Check DNS records and try again.",
             issues,
         )
     return ScanInput.model_validate({**config.model_dump(), "targets": sorted(addresses)})
