@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     spray_account_budget: int = 2
     spray_service_budget: int = 10
     max_credentials: int = 10
+    max_hydra_pairs: int = 1000
     eyewitness_enabled: bool = False
 
 

@@ -1,5 +1,7 @@
 FROM python:3.12-slim-bookworm AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+RUN apt-get update && apt-get install -y --no-install-recommends hydra \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY backend/pyproject.toml backend/requirements.lock ./
 RUN python -c "import subprocess,tomllib; subprocess.check_call(['pip','install','--no-cache-dir','-c','requirements.lock',*tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']])" \

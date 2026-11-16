@@ -23,7 +23,7 @@ class ScopeProxy(ThreadingHTTPServer):
     def __init__(self, scope, url):
         self.scope = scope
         self.allowed_origin = self.origin(url)
-        super().__init__(("127.0.0.1", 0), ProxyHandler)
+        super().__init__(("127.0.0.1", 0), getattr(self, "handler", ProxyHandler))
 
     @staticmethod
     def origin(url):

@@ -2,6 +2,7 @@ import uuid
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -53,6 +54,7 @@ class Credential(Entity, Base):
     label: Mapped[str] = mapped_column(String(200))
     username: Mapped[str] = mapped_column(String(200))
     encrypted_secret: Mapped[str] = mapped_column(Text)
+    generated: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_at: Mapped[object] = mapped_column(DateTime, default=now, onupdate=now)
 
 

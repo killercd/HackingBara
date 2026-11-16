@@ -1,6 +1,7 @@
 import time
 import uuid
 from collections import defaultdict
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from sqlalchemy import func, select, text
@@ -11,7 +12,10 @@ from . import scanners
 from .capture import capture
 from .config import settings
 from .db import SessionLocal, now
-from .network import basic_auth, request
+from .hydra import detected_service
+from .hydra import http_auth as basic_auth
+from .hydra import validate as hydra_auth
+from .network import request
 from .scope import EndpointScope, ScanInput, Scope, ScopePreparationError, hostname_url, normalize_url
 from .security import cipher
 
@@ -52,15 +56,17 @@ def finding(db, run, kind, identity, evidence):
     )
 
 
-def spray_order(credentials):
-    # Approved pairs only. Never manufacture the Cartesian product of accounts and secrets.
+def spray_order(credentials, preserve_order=False):
+    # List-mode combinations are approved at save time; legacy library pairs remain paired.
     groups = defaultdict(list)
     for credential in credentials:
         groups[cipher().decrypt(credential.encrypted_secret.encode()).decode()].append(credential)
     return [
         (credential, password)
-        for password in sorted(groups)
-        for credential in sorted(groups[password], key=lambda c: (c.username, c.id))
+        for password in (groups if preserve_order else sorted(groups))
+        for credential in (
+            groups[password] if preserve_order else sorted(groups[password], key=lambda c: (c.username, c.id))
+        )
     ]
 
 
@@ -318,16 +324,60 @@ class Runner:
         if not config.password_spray:
             return
         approved = db.scalars(select(m.Credential).where(m.Credential.id.in_(config.credential_ids))).all()
-        if len(approved) > settings.max_credentials:
+        if len(approved) > (settings.max_hydra_pairs if config.hydra_usernames else settings.max_credentials):
             raise ValueError("Credential limit exceeded")
         # Precreate durable intentions: an interrupted network attempt becomes unknown, never retried.
-        endpoints = db.scalars(
-            select(m.EndpointObservation).where(
-                m.EndpointObservation.run_id == run.id,
-                m.EndpointObservation.url.in_(config.credential_endpoints),
-                m.EndpointObservation.status != "error",
-            )
-        ).all()
+        endpoint_query = select(m.EndpointObservation).where(
+            m.EndpointObservation.run_id == run.id, m.EndpointObservation.status != "error"
+        )
+        if config.credential_auto_detect:
+            from .scope import port_set
+
+            endpoint_query = endpoint_query.where(m.EndpointObservation.port.in_(port_set(config.ports)))
+        else:
+            endpoint_query = endpoint_query.where(m.EndpointObservation.url.in_(config.credential_endpoints))
+        endpoints = db.scalars(endpoint_query).all()
+        hydra_targets = {}
+        targets = list(config.credential_services)
+        if config.credential_auto_detect:
+            for service in db.scalars(
+                select(m.ServiceObservation)
+                .where(m.ServiceObservation.run_id == run.id, m.ServiceObservation.state == "open")
+                .order_by(m.ServiceObservation.ip, m.ServiceObservation.port)
+            ):
+                target = detected_service(service)
+                if target and not any(
+                    item.host == target.host and item.port == target.port for item in targets
+                ):
+                    targets.append(target)
+        seen_targets = set()
+        for target in targets:
+            if target.url in seen_targets:
+                continue
+            seen_targets.add(target.url)
+            self.boundary(db, run, "credentials")
+            try:
+                addresses, _ = scope.resolve(hostname_url(target.host))
+                service = db.scalar(
+                    select(m.ServiceObservation)
+                    .where(
+                        m.ServiceObservation.run_id == run.id,
+                        m.ServiceObservation.ip == addresses[0],
+                        m.ServiceObservation.port == target.port,
+                        m.ServiceObservation.state == "open",
+                    )
+                    .limit(1)
+                )
+                endpoint = get_or_create(
+                    db,
+                    m.Endpoint,
+                    url=target.url,
+                    defaults={"service_id": service.service_id if service else None},
+                )
+                endpoints.append(SimpleNamespace(id=endpoint.id, endpoint_id=endpoint.id, url=target.url))
+                hydra_targets[endpoint.id] = (target, EndpointScope(scope, addresses[0]))
+            except (ValueError, OSError) as exc:
+                self.error(db, run, "Hydra target scope rejected", exc)
         for endpoint in endpoints:
             for cred in approved:
                 get_or_create(
@@ -354,8 +404,11 @@ class Runner:
                 services[urlsplit(a.url).netloc] += 1
             if a.status in ("blocked", "unknown"):
                 blocked.add(urlsplit(a.url).netloc)
-        # Password-first across all approved services; each account gets only its approved pairs.
-        for cred, password in spray_order(approved):
+        # List mode preserves the operator's password and username order.
+        if config.hydra_usernames:
+            positions = {identity: index for index, identity in enumerate(config.credential_ids)}
+            approved.sort(key=lambda credential: positions[credential.id])
+        for cred, password in spray_order(approved, preserve_order=bool(config.hydra_usernames)):
             for endpoint in endpoints:
                 self.boundary(db, run, "credentials")
                 a = db.scalar(
@@ -382,7 +435,20 @@ class Runner:
                 accounts[a.username] += 1
                 services[urlsplit(a.url).netloc] += 1
                 try:
-                    a.status, a.evidence = basic_auth(scope, endpoint.url, cred.username, password)
+                    if endpoint.id in hydra_targets:
+                        a.status, a.evidence = hydra_auth(
+                            hydra_targets[endpoint.id][1],
+                            hydra_targets[endpoint.id][0],
+                            cred.username,
+                            password,
+                            self.tick,
+                        )
+                    else:
+                        a.status, a.evidence = basic_auth(
+                            scope, endpoint.url, cred.username, password, self.tick
+                        )
+                except scanners.Interrupted:
+                    raise
                 except Exception:
                     a.status, a.evidence = "unknown", "Connection or TLS validation error; no retry"
                 if a.status in ("blocked", "unknown"):

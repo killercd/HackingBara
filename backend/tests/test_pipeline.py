@@ -171,7 +171,7 @@ def test_password_first_pair_order_budgets_and_immutability(auth, db_factory, fa
     ).json()
     calls = []
 
-    def attempt(scope, url, username, password):
+    def attempt(scope, url, username, password, tick=None):
         calls.append((password, username))
         return "failed", "Challenge rejected"
 

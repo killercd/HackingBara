@@ -127,6 +127,41 @@ def import_wordlist(content: str, domain: str):
     return list(words), report
 
 
+class HydraService(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    module: str = Field(pattern=r"^[a-z][a-z0-9-]{0,63}$")
+    host: str = Field(min_length=1, max_length=253)
+    port: int = Field(ge=1, le=65535)
+    options: str = Field(default="", max_length=2048)
+    tls: bool = False
+
+    @field_validator("host")
+    @classmethod
+    def clean_host(cls, value):
+        # Reuse hostname/IPv6 validation without allowing URL credentials or paths.
+        value = value.strip().strip("[]")
+        url = hostname_url(value)
+        normalized = normalize_url(url)
+        if urlsplit(normalized).path != "/" or urlsplit(normalized).query:
+            raise ValueError("Provide a hostname or IP address only")
+        return urlsplit(normalized).hostname
+
+    @field_validator("options")
+    @classmethod
+    def clean_options(cls, value):
+        if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError("Module options cannot contain control characters")
+        return value
+
+    @property
+    def url(self):
+        from hashlib import sha256
+
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        profile = sha256((str(self.tls) + self.options).encode()).hexdigest()[:16]
+        return f"{self.module}://{host}:{self.port}/?profile={profile}"
+
+
 class ScanInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=200)
@@ -140,8 +175,13 @@ class ScanInput(BaseModel):
     ports: str = ""
     urls: list[str] = Field(default_factory=list, max_length=256)
     hostnames: list[str] = Field(default_factory=list)
-    credential_ids: list[str] = Field(default_factory=list, max_length=10)
+    credential_ids: list[str] = Field(default_factory=list, max_length=1000)
     password_spray: bool = False
+    hydra_usernames: list[str] = Field(default_factory=list, max_length=100)
+    hydra_passwords: list[str] | None = Field(default=None, max_length=100, exclude=True)
+    hydra_password_count: int = Field(default=0, ge=0, le=100)
+    credential_auto_detect: bool = False
+    credential_services: list[HydraService] = Field(default_factory=list, max_length=10)
     credential_endpoints: list[str] = Field(default_factory=list, max_length=10)
     screenshots: bool = False
     searchsploit: bool = False
@@ -150,6 +190,27 @@ class ScanInput(BaseModel):
     request_timeout: float = Field(default=2, ge=0.001, le=300, allow_inf_nan=False)
     max_threads: int = Field(default=10, ge=1, le=1024)
     network_timing: int = Field(default=3, ge=0, le=5)
+
+    @field_validator("hydra_usernames")
+    @classmethod
+    def clean_hydra_usernames(cls, values):
+        cleaned = list(dict.fromkeys(value.strip() for value in values))
+        if any(
+            not value or len(value) > 200 or any(char in value for char in "\r\n\x00") for value in cleaned
+        ):
+            raise ValueError("Hydra usernames must be nonempty single-line values of at most 200 characters")
+        return cleaned
+
+    @field_validator("hydra_passwords")
+    @classmethod
+    def clean_hydra_passwords(cls, values):
+        if values is None:
+            return None
+        if any(
+            not value or len(value) > 1000 or any(char in value for char in "\r\n\x00") for value in values
+        ):
+            raise ValueError("Hydra passwords must be nonempty single-line values of at most 1000 characters")
+        return list(dict.fromkeys(values))
 
     @model_validator(mode="before")
     @classmethod
@@ -266,7 +327,12 @@ class ScanInput(BaseModel):
                 or self.urls
                 or self.credential_ids
                 or self.password_spray
+                or self.hydra_usernames
+                or self.hydra_passwords
+                or self.hydra_password_count
                 or self.credential_endpoints
+                or self.credential_services
+                or self.credential_auto_detect
                 or self.screenshots
                 or self.searchsploit
             ):
@@ -274,13 +340,27 @@ class ScanInput(BaseModel):
             return self
         if not self.targets and not self.urls and not self.hostnames:
             raise ValueError("Provide at least one IP/CIDR target, hostname or HTTP(S) URL")
+        if self.hydra_usernames:
+            self.credential_auto_detect = True
+        if len(self.hydra_usernames) * len(self.hydra_passwords or []) > settings.max_hydra_pairs:
+            raise ValueError("Hydra user/password combination limit exceeded")
         if len(set(self.credential_ids)) != len(self.credential_ids):
             raise ValueError("Duplicate credential references")
-        if self.password_spray and (not self.credential_ids or not self.credential_endpoints):
+        if self.password_spray and (
+            not (
+                self.credential_ids
+                or (self.hydra_usernames and (self.hydra_passwords or self.hydra_password_count))
+            )
+            or not (self.credential_endpoints or self.credential_services or self.credential_auto_detect)
+        ):
             raise ValueError("Credential validation requires credentials and explicit endpoint approval")
         if any(url not in self.urls for url in self.credential_endpoints):
             raise ValueError("Approved credential endpoints must be explicit scan URLs")
-        for url in self.urls + [hostname_url(host) for host in self.hostnames]:
+        for url in (
+            self.urls
+            + [hostname_url(host) for host in self.hostnames]
+            + [hostname_url(service.host) for service in self.credential_services]
+        ):
             try:
                 ipaddress.ip_address(urlsplit(url).hostname)
             except ValueError:

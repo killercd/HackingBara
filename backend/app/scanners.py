@@ -55,7 +55,7 @@ def kill_group(process):
         pass
 
 
-def run_tool(argv, timeout, tick=lambda: None, env=None, *, on_stdout=None, capture_stdout=True):
+def run_tool(argv, timeout, tick=lambda: None, env=None, *, on_stdout=None, capture_stdout=True, cwd=None):
     start = time.monotonic()
     output = {"stdout": bytearray(), "stderr": bytearray()}
     guarded = [sys.executable, str(Path(__file__).with_name("process_guard.py")), str(os.getpid()), *argv]
@@ -66,6 +66,7 @@ def run_tool(argv, timeout, tick=lambda: None, env=None, *, on_stdout=None, capt
         stdin=subprocess.DEVNULL,
         start_new_session=True,
         env=env,
+        cwd=cwd,
     ) as process:
         selector = selectors.DefaultSelector()
         for name in output:
@@ -174,6 +175,7 @@ def parse_nmap(xml, address, discovered_ports):
                     "confidence": int(attrs.get("conf", "0")),
                     "details": {
                         "tunnel": attrs.get("tunnel"),
+                        "method": attrs.get("method"),
                         "cpe": [c.text for c in service.findall("cpe")] if service is not None else [],
                     },
                 }

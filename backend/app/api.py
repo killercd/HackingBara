@@ -9,11 +9,12 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from sqlalchemy import String, cast, func, or_, select, text
+from sqlalchemy import String, cast, delete, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
 from starlette.datastructures import UploadFile
 
+from . import hydra
 from . import models as m
 from .config import settings
 from .db import get_db, now
@@ -26,7 +27,15 @@ User = Annotated[m.User, Depends(current_user)]
 
 
 def serialize(row):
-    hidden = {"password_hash", "encrypted_secret", "token_hash", "csrf_hash", "path", "thumbnail_path"}
+    hidden = {
+        "password_hash",
+        "encrypted_secret",
+        "generated",
+        "token_hash",
+        "csrf_hash",
+        "path",
+        "thumbnail_path",
+    }
     result = {}
     for column in row.__table__.columns:
         if column.name in hidden:
@@ -42,8 +51,20 @@ def serialize(row):
 
 
 def result_columns(model):
-    hidden = {"encrypted_secret", "password_hash", "token_hash", "csrf_hash", "path", "thumbnail_path"}
+    hidden = {
+        "encrypted_secret",
+        "generated",
+        "password_hash",
+        "token_hash",
+        "csrf_hash",
+        "path",
+        "thumbnail_path",
+    }
     columns = {c.name: getattr(model, c.name) for c in model.__table__.columns if c.name not in hidden}
+    if model is m.Attempt:
+        columns["credential_label"] = (
+            select(m.Credential.label).where(m.Credential.id == model.credential_id).scalar_subquery()
+        )
     if model is m.Scan:
         columns["summary"] = (
             select(m.Run.processed)
@@ -298,7 +319,19 @@ def login(body: LoginInput, request: Request, response: Response, db: DB):
 
 @router.get("/capabilities")
 def capabilities(user: User):
-    return {"screenshots": settings.eyewitness_enabled, "searchsploit": True}
+    return {
+        "screenshots": settings.eyewitness_enabled,
+        "searchsploit": True,
+        "hydra_modules": hydra.modules(),
+    }
+
+
+@router.get("/credential-modules/{module}")
+def credential_module(module: str, user: User):
+    try:
+        return {"module": module, "help": hydra.module_help(module)}
+    except (ValueError, OSError, TimeoutError, hydra.subprocess.TimeoutExpired):
+        raise HTTPException(422, "Hydra module help unavailable") from None
 
 
 @router.get("/auth/me")
@@ -325,8 +358,60 @@ def scans(user: User, db: DB, args: Annotated[Page, Query()]):
     return data
 
 
+def clean_generated_credentials(db):
+    db.execute(
+        delete(m.Credential).where(
+            m.Credential.generated.is_(True),
+            ~select(m.ScanCredential.scan_id)
+            .where(m.ScanCredential.credential_id == m.Credential.id)
+            .exists(),
+            ~select(m.RunCredential.run_id).where(m.RunCredential.credential_id == m.Credential.id).exists(),
+            ~select(m.Attempt.id).where(m.Attempt.credential_id == m.Credential.id).exists(),
+        )
+    )
+
+
+def hydra_list_credentials(db, scan, body):
+    source_ids = (scan.config or {}).get("credential_ids", [])
+    source = db.scalars(select(m.Credential).where(m.Credential.id.in_(source_ids))).all()
+    positions = {identity: index for index, identity in enumerate(source_ids)}
+    source.sort(key=lambda row: positions[row.id])
+    decrypted = [(row, cipher().decrypt(row.encrypted_secret.encode()).decode()) for row in source]
+    passwords = body.hydra_passwords
+    if passwords is None:
+        passwords = list(dict.fromkeys(value for _, value in decrypted))
+    if not passwords or not body.hydra_usernames:
+        raise HTTPException(422, "Provide a username list and a password list for Hydra")
+    if len(passwords) * len(body.hydra_usernames) > settings.max_hydra_pairs:
+        raise HTTPException(422, "Hydra user/password combination limit exceeded")
+    existing = {(row.username, value, row.label): row for row, value in decrypted if row.generated}
+    pairs = []
+    for index, password in enumerate(passwords, 1):
+        for username in body.hydra_usernames:
+            label = f"Hydra password #{index}"
+            row = existing.get((username, password, label))
+            if row is None:
+                row = m.Credential(
+                    username=username,
+                    label=label,
+                    generated=True,
+                    encrypted_secret=cipher().encrypt(password.encode()).decode(),
+                )
+                db.add(row)
+            pairs.append(row)
+    db.flush()
+    body.hydra_password_count = len(passwords)
+    body.credential_auto_detect = True
+    body.credential_services, body.credential_endpoints = [], []
+    body.credential_ids = [row.id for row in pairs]
+    return body.credential_ids
+
+
 def save_scan(db, scan, body):
-    ids = body.credential_ids
+    list_mode = bool(body.hydra_usernames or body.hydra_passwords is not None or body.hydra_password_count)
+    if not list_mode and len(body.credential_ids) > settings.max_credentials:
+        raise HTTPException(422, "Credential selection limit exceeded")
+    ids = hydra_list_credentials(db, scan, body) if list_mode else body.credential_ids
     if len(db.scalars(select(m.Credential.id).where(m.Credential.id.in_(ids))).all()) != len(ids):
         raise HTTPException(422, "Unknown credential reference")
     scan.name, scan.description = body.name, body.description
@@ -341,6 +426,8 @@ def save_scan(db, scan, body):
     db.query(m.ScanCredential).filter_by(scan_id=scan.id).delete()
     for credential_id in ids:
         db.add(m.ScanCredential(scan_id=scan.id, credential_id=credential_id))
+    db.flush()
+    clean_generated_credentials(db)
     db.commit()
     return serialize(scan)
 
@@ -420,7 +507,18 @@ async def create_scan(request: Request, user: User, db: DB):
 
 @router.get("/scans/{scan_id}")
 def scan_detail(scan_id: str, user: User, db: DB):
-    return serialize(get_or_404(db, m.Scan, scan_id))
+    scan = get_or_404(db, m.Scan, scan_id)
+    item = serialize(scan)
+    if scan.config.get("credential_ids") and not scan.config.get("hydra_usernames"):
+        rows = db.scalars(
+            select(m.Credential).where(m.Credential.id.in_(scan.config["credential_ids"]))
+        ).all()
+        item["config"] = {
+            **scan.config,
+            "hydra_usernames": list(dict.fromkeys(row.username for row in rows)),
+            "hydra_password_count": len({cipher().decrypt(row.encrypted_secret.encode()) for row in rows}),
+        }
+    return item
 
 
 @router.patch("/scans/{scan_id}")
@@ -438,6 +536,8 @@ def delete_scan(scan_id: str, user: User, db: DB):
     if any(r.status in m.ACTIVE for r in runs):
         raise HTTPException(409, "Stop all active runs before deleting this scan")
     db.delete(scan)
+    db.flush()
+    clean_generated_credentials(db)
     db.commit()
     for run in runs:
         shutil.rmtree(settings.evidence_dir / run.id, ignore_errors=True)
@@ -638,19 +738,19 @@ class CredentialInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     label: str = Field(min_length=1, max_length=200)
     username: str = Field(min_length=1, max_length=200, pattern=r"^[^:\r\n\x00]+$")
-    password: str = Field(min_length=1, max_length=1000)
+    password: str = Field(min_length=1, max_length=65536)
 
 
 class CredentialPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     label: str | None = Field(None, min_length=1, max_length=200)
     username: str | None = Field(None, min_length=1, max_length=200, pattern=r"^[^:\r\n\x00]+$")
-    password: str | None = Field(None, min_length=1, max_length=1000)
+    password: str | None = Field(None, min_length=1, max_length=65536)
 
 
 @router.get("/credentials")
 def credentials(user: User, db: DB, args: Annotated[Page, Query()]):
-    return paginate(db, m.Credential, select(m.Credential), args)
+    return paginate(db, m.Credential, select(m.Credential).where(m.Credential.generated.is_(False)), args)
 
 
 @router.post("/credentials", status_code=201)

@@ -209,7 +209,7 @@ test('DNS results prefill a Network scan with all names independently of table f
     else if(path.endsWith('/runs/source-dns/subdomains'))json={items:[{id:'visible',identity:names[0],evidence:{addresses:['192.0.2.1']}}],total:1,total_pages:1}
     else if(path.endsWith('/runs/source-dns/network-draft')){
       expect(new URL(route.request().url()).search).toBe('')
-      json={config:{mode:'network',name:'Network - example.test',description:'From DNS results',targets:[],hostnames:[],urls:names},source:{scan_id:'dns-scan',run_id:'source-dns',domain:'example.test',status:'stopped',target_count:125}}
+      json={config:{mode:'network',name:'Network - example.test',description:'From DNS results',targets:[],hostnames:[],urls:names,hydra_usernames:[]},source:{scan_id:'dns-scan',run_id:'source-dns',domain:'example.test',status:'stopped',target_count:125}}
     }else if(path.endsWith('/scans')&&route.request().method()==='POST'){
       saveCount++
       saved=route.request().postDataJSON()
