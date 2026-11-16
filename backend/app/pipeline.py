@@ -419,23 +419,26 @@ class Runner:
             self.boundary(db, run, "searchsploit")
             if self.checkpoint(db, run, "searchsploit", service.id):
                 continue
-            banner = " ".join(filter(None, [service.product, service.version])) or service.banner
-            endpoint = db.scalar(
-                select(m.EndpointObservation)
-                .where(
-                    m.EndpointObservation.run_id == run.id,
-                    m.EndpointObservation.ip == service.ip,
-                    m.EndpointObservation.port == service.port,
+            product, version = service.product.strip(), service.version.strip()
+            banner = " ".join(filter(None, [product, version]))
+            if not product or not version:
+                get_or_create(
+                    db,
+                    m.CVEMatch,
+                    run_id=run.id,
+                    service_id=service.service_id,
+                    edb_id="",
+                    defaults={
+                        "ip": service.ip,
+                        "port": service.port,
+                        "banner": banner,
+                        "query": "",
+                        "status": "skipped",
+                        "title": "Search skipped: product name and version are required",
+                    },
                 )
-                .order_by(m.EndpointObservation.url)
-                .limit(1)
-            )
-            if not banner and endpoint:
-                banner = " ".join(
-                    value
-                    for key, value in endpoint.details.get("response_headers", [])
-                    if key.lower() == "server"
-                )
+                self.done(db, run, "searchsploit", service.id)
+                continue
             try:
                 query, matches = scanners.searchsploit(banner, self.tick)
                 for match in matches or [

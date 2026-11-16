@@ -3,6 +3,7 @@ import io
 import json
 import socket
 
+import pytest
 from test_pipeline import fake_tools, launch  # noqa: F401, F811
 
 from app import models as m
@@ -71,7 +72,7 @@ def test_result_hostnames_headers_cve_sort_and_csv(auth, db_factory, fake_tools,
     Runner(identity, claim(identity)).run()
     base = f"/api/v1/runs/{identity}"
     assert auth.get(base).json()["status"] == "completed"
-    assert calls
+    assert calls == ["nginx 1.26"]
     services = auth.get(base + "/services?sort_by=hostname&sort_order=asc").json()["items"]
     assert services[0]["hostname"] == "web.example"
     assert services[0]["details"]["response_headers"][-1] == ["X-Test", "second"]
@@ -79,7 +80,7 @@ def test_result_hostnames_headers_cve_sort_and_csv(auth, db_factory, fake_tools,
         "hosts": ["hostname", "open_ports", "services", "first_seen_at", "last_seen_at"],
         "services": ["transport", "banner", "confidence", "details", "first_seen_at"],
         "endpoints": ["hostname", "details", "screenshot"],
-        "cve": ["hostname", "cve", "query", "title", "port"],
+        "cve": ["hostname", "cve", "query", "title", "port", "details"],
         "events": ["details", "level", "stage"],
     }.items():
         for field in fields:
@@ -87,11 +88,13 @@ def test_result_hostnames_headers_cve_sort_and_csv(auth, db_factory, fake_tools,
             assert response.status_code == 200, response.text
     rows = auth.get(base + "/cve").json()["items"]
     assert rows[0]["cve"] == "CVE-2020-1234", (rows, auth.get(base + "/events?status=error").json())
+    assert rows[0]["details"] == services[0]["details"]
     export = auth.get(base + "/cve/export.csv?status=candidate&sort_by=port&sort_order=asc")
     assert export.status_code == 200
     exported = list(csv.DictReader(io.StringIO(export.content.decode("utf-8-sig"))))
     assert exported[0]["title"] == "'=candidate"
     assert exported[0]["hostname"] == "web.example"
+    assert exported[0]["details"] == "Server: nginx/1.2\nX-Test: first\nX-Test: second"
     assert auth.get(base + "/cve/export.csv?status=error").status_code == 200
     assert auth.get(base + "/services/export.csv?sort_by=password_hash").status_code == 422
 
@@ -140,3 +143,29 @@ def test_capture_retries_missing_image_and_preserves_artifact(monkeypatch, tmp_p
     assert len(calls) == 2
     assert (tmp_path / path).is_file() and (tmp_path / thumbnail).is_file()
     assert (width, height) == (640, 480)
+
+
+@pytest.mark.parametrize(
+    "product,version", [("Apache", ""), ("", "2.4.49"), ("", ""), ("  ", "2.4.49"), ("Apache", "  ")]
+)
+def test_searchsploit_skips_incomplete_identity(auth, scan, fake_tools, monkeypatch, product, version):  # noqa: F811
+    original = scanners.nmap
+
+    def incomplete(*args, **kwargs):
+        observations, result, argv = original(*args, **kwargs)
+        for observation in observations:
+            observation.update(product=product, version=version, banner="Apache 2.4.49")
+        return observations, result, argv
+
+    monkeypatch.setattr(scanners, "nmap", incomplete)
+    monkeypatch.setattr(pipeline, "request", lambda *a, **k: (200, [("Server", "Apache/2.4.49")]))
+    assert auth.patch(f"/api/v1/scans/{scan['id']}", json={"searchsploit": True}).status_code == 200
+    identity = launch(auth, scan)
+    Runner(identity, claim(identity)).run()
+    base = f"/api/v1/runs/{identity}"
+    assert auth.get(base).json()["status"] == "completed"
+    rows = auth.get(base + "/cve").json()["items"]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "skipped"
+    assert rows[0]["query"] == "" and rows[0]["edb_id"] == ""
+    assert "product name and version are required" in rows[0]["title"]

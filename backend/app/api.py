@@ -78,6 +78,24 @@ def result_columns(model):
             .scalar_subquery(),
             model.details,
         )
+    if model is m.CVEMatch:
+        columns["details"] = func.coalesce(
+            select(m.EndpointObservation.details)
+            .where(
+                m.EndpointObservation.run_id == model.run_id,
+                m.EndpointObservation.ip == model.ip,
+                m.EndpointObservation.port == model.port,
+            )
+            .order_by(m.EndpointObservation.url)
+            .limit(1)
+            .scalar_subquery(),
+            select(m.ServiceObservation.details)
+            .where(
+                m.ServiceObservation.run_id == model.run_id,
+                m.ServiceObservation.service_id == model.service_id,
+            )
+            .scalar_subquery(),
+        )
     if model is m.Screenshot:
         columns["hostname"] = (
             select(m.RunHost.hostname)
