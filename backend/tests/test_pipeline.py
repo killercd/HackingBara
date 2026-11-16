@@ -42,6 +42,7 @@ def fake_tools(monkeypatch):
         pipeline, "basic_auth", lambda *a, **k: pytest.fail("Credential validation must be opt-in")
     )
     monkeypatch.setattr(pipeline, "capture", lambda *a, **k: pytest.fail("Screenshots must be opt-in"))
+    monkeypatch.setattr(scanners, "searchsploit", lambda *a, **k: pytest.fail("SearchSploit must be opt-in"))
     return calls
 
 

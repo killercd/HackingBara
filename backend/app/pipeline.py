@@ -11,7 +11,7 @@ from . import scanners
 from .capture import capture
 from .config import settings
 from .db import SessionLocal, now
-from .network import basic_auth
+from .network import basic_auth, request
 from .scope import EndpointScope, ScanInput, Scope, ScopePreparationError, hostname_url, normalize_url
 from .security import cipher
 
@@ -264,6 +264,8 @@ class Runner:
             except (ValueError, OSError) as exc:
                 if name in config.hostnames:
                     self.error(db, run, f"Hostname scope rejected: {name}", exc)
+        for host in db.scalars(select(m.RunHost).where(m.RunHost.run_id == run.id)):
+            host.hostname = "\n".join(sorted(aliases.get(host.ip, [])))
         for service in db.scalars(
             select(m.ServiceObservation)
             .where(
@@ -295,13 +297,19 @@ class Runner:
                     raise ValueError("HTTP service hostname no longer resolves to the observed address")
                 endpoint = get_or_create(db, m.Endpoint, url=url, defaults={"service_id": service_id})
                 endpoint.last_seen_at = now()
-                get_or_create(
+                observation = get_or_create(
                     db,
                     m.EndpointObservation,
                     run_id=run.id,
                     endpoint_id=endpoint.id,
                     defaults={"url": url, "ip": preferred_ip or addresses[0], "port": port, "source": source},
                 )
+                try:
+                    status, headers = request(EndpointScope(scope, observation.ip), url, raw_headers=True)
+                    observation.details = {"http_status": status, "response_headers": headers}
+                except (OSError, ValueError) as exc:
+                    observation.details = {"error": f"HTTP headers unavailable: {type(exc).__name__}"}
+
             except (ValueError, OSError) as exc:
                 self.error(db, run, "Endpoint scope rejected", exc)
             self.done(db, run, "endpoints", url)
@@ -399,6 +407,77 @@ class Runner:
                 db.commit()
                 self.summarize(db, run)
 
+    def searchsploit(self, db, run, config):
+        if not config.searchsploit:
+            return
+        services = db.scalars(
+            select(m.ServiceObservation).where(
+                m.ServiceObservation.run_id == run.id, m.ServiceObservation.state == "open"
+            )
+        ).all()
+        for service in services:
+            self.boundary(db, run, "searchsploit")
+            if self.checkpoint(db, run, "searchsploit", service.id):
+                continue
+            banner = " ".join(filter(None, [service.product, service.version])) or service.banner
+            endpoint = db.scalar(
+                select(m.EndpointObservation)
+                .where(
+                    m.EndpointObservation.run_id == run.id,
+                    m.EndpointObservation.ip == service.ip,
+                    m.EndpointObservation.port == service.port,
+                )
+                .order_by(m.EndpointObservation.url)
+                .limit(1)
+            )
+            if not banner and endpoint:
+                banner = " ".join(
+                    value
+                    for key, value in endpoint.details.get("response_headers", [])
+                    if key.lower() == "server"
+                )
+            try:
+                query, matches = scanners.searchsploit(banner, self.tick)
+                for match in matches or [
+                    {
+                        "status": "no_matches" if query else "skipped",
+                        "title": "No matching records" if query else "No usable server banner",
+                    }
+                ]:
+                    get_or_create(
+                        db,
+                        m.CVEMatch,
+                        run_id=run.id,
+                        service_id=service.service_id,
+                        edb_id=match.get("edb_id", ""),
+                        defaults={
+                            "ip": service.ip,
+                            "port": service.port,
+                            "banner": banner,
+                            "query": query,
+                            **{key: value for key, value in match.items() if key != "edb_id"},
+                        },
+                    )
+            except scanners.Interrupted:
+                raise
+            except Exception as exc:
+                get_or_create(
+                    db,
+                    m.CVEMatch,
+                    run_id=run.id,
+                    service_id=service.service_id,
+                    edb_id="",
+                    defaults={
+                        "ip": service.ip,
+                        "port": service.port,
+                        "banner": banner,
+                        "status": "error",
+                        "title": "SearchSploit lookup failed; see events",
+                    },
+                )
+                self.error(db, run, "SearchSploit", exc)
+            self.done(db, run, "searchsploit", service.id)
+
     def screenshots(self, db, run, config, scope):
         if not config.screenshots:
             return
@@ -428,7 +507,12 @@ class Runner:
             except scanners.Interrupted:
                 raise
             except Exception as exc:
-                shot.status, shot.error = "error", "Screenshot capture failed; see stage events"
+                shot.status = "error"
+                shot.error = (
+                    str(exc)[:500]
+                    if isinstance(exc, scanners.ToolError)
+                    else "Screenshot capture failed; see stage events"
+                )
                 endpoint.status = "error"
                 self.error(db, run, "Screenshot", exc)
             self.done(db, run, "screenshots", endpoint.id)
@@ -685,6 +769,7 @@ class Runner:
                         db.commit()
                         self.summarize(db, run)
                     self.endpoints(db, run, config, scope)
+                    self.searchsploit(db, run, config)
                     self.credentials(db, run, config, scope)
                     self.screenshots(db, run, config, scope)
                 self.boundary(db, run, "consolidation")

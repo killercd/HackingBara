@@ -1,3 +1,5 @@
+import csv
+import io
 import json
 import math
 import shutil
@@ -39,16 +41,89 @@ def serialize(row):
     return result
 
 
+def result_columns(model):
+    hidden = {"encrypted_secret", "password_hash", "token_hash", "csrf_hash", "path", "thumbnail_path"}
+    columns = {c.name: getattr(model, c.name) for c in model.__table__.columns if c.name not in hidden}
+    if model is m.Scan:
+        columns["summary"] = (
+            select(m.Run.processed)
+            .where(m.Run.scan_id == model.id)
+            .order_by(m.Run.created_at.desc())
+            .limit(1)
+            .scalar_subquery()
+        )
+    if model in (m.RunHost, m.ServiceObservation):
+        inventory = m.Host if model is m.RunHost else m.Service
+        foreign = model.host_id if model is m.RunHost else model.service_id
+        for label, field in (("first_seen_at", "created_at"), ("last_seen_at", "last_seen_at")):
+            columns[label] = (
+                select(getattr(inventory, field)).where(inventory.id == foreign).scalar_subquery()
+            )
+    if model in (m.ServiceObservation, m.EndpointObservation, m.CVEMatch):
+        columns["hostname"] = (
+            select(m.RunHost.hostname)
+            .where(m.RunHost.run_id == model.run_id, m.RunHost.ip == model.ip)
+            .scalar_subquery()
+        )
+    if model is m.ServiceObservation:
+        columns["details"] = func.coalesce(
+            select(m.EndpointObservation.details)
+            .where(
+                m.EndpointObservation.run_id == model.run_id,
+                m.EndpointObservation.ip == model.ip,
+                m.EndpointObservation.port == model.port,
+            )
+            .order_by(m.EndpointObservation.url)
+            .limit(1)
+            .scalar_subquery(),
+            model.details,
+        )
+    if model is m.Screenshot:
+        columns["hostname"] = (
+            select(m.RunHost.hostname)
+            .join(
+                m.EndpointObservation,
+                (m.EndpointObservation.run_id == m.RunHost.run_id)
+                & (m.EndpointObservation.ip == m.RunHost.ip),
+            )
+            .where(
+                m.EndpointObservation.run_id == model.run_id,
+                m.EndpointObservation.endpoint_id == model.endpoint_id,
+            )
+            .scalar_subquery()
+        )
+        columns["image"] = model.status
+    if model is m.EndpointObservation:
+        columns["screenshot"] = (
+            select(m.Screenshot.status)
+            .where(m.Screenshot.run_id == model.run_id, m.Screenshot.endpoint_id == model.endpoint_id)
+            .scalar_subquery()
+        )
+    return columns
+
+
 def serialize_inventory(db, row):
     item = serialize(row)
-    persistent = None
+    columns = result_columns(type(row))
+    derived = columns.keys() - item.keys()
+    if isinstance(row, (m.RunHost, m.ServiceObservation)):
+        derived |= {"first_seen_at", "last_seen_at"}
+    for key in derived:
+        value = db.scalar(select(columns[key]).where(type(row).id == row.id))
+        item[key] = value.isoformat() + "Z" if isinstance(value, datetime) else value
     if isinstance(row, m.ServiceObservation):
-        persistent = db.get(m.Service, row.service_id)
-    elif isinstance(row, m.RunHost):
-        persistent = db.get(m.Host, row.host_id)
-    if persistent:
-        item["first_seen_at"] = persistent.created_at.isoformat() + "Z"
-        item["last_seen_at"] = persistent.last_seen_at.isoformat() + "Z"
+        endpoint = db.scalar(
+            select(m.EndpointObservation)
+            .where(
+                m.EndpointObservation.run_id == row.run_id,
+                m.EndpointObservation.ip == row.ip,
+                m.EndpointObservation.port == row.port,
+            )
+            .order_by(m.EndpointObservation.url)
+            .limit(1)
+        )
+        if endpoint:
+            item["details"] = endpoint.details
     return item
 
 
@@ -63,14 +138,8 @@ class Page(BaseModel):
 
 
 def paginate(db, model, query, args):
-    allowed_sort = {
-        c.name
-        for c in model.__table__.columns
-        if isinstance(c.type, (String,))
-        or c.name in {"created_at", "updated_at", "last_run_at", "port", "attempted_at", "captured_at"}
-    }
-    allowed_sort -= {"encrypted_secret", "password_hash", "path", "thumbnail_path"}
-    if args.sort_by not in allowed_sort:
+    columns = result_columns(model)
+    if args.sort_by not in columns:
         raise HTTPException(422, "Unsupported sort field")
     if args.search:
         fields = [
@@ -90,10 +159,17 @@ def paginate(db, model, query, args):
                 "product",
                 "version",
                 "identity",
+                "hostname",
+                "banner",
+                "title",
+                "cve",
+                "edb_id",
                 "event_type",
                 "evidence",
             }
         ]
+        if "hostname" in columns and "hostname" not in model.__table__.columns:
+            fields.append(columns["hostname"])
         if fields:
             term = args.search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             query = query.where(or_(*(cast(c, String).ilike(f"%{term}%", escape="\\") for c in fields)))
@@ -117,7 +193,9 @@ def paginate(db, model, query, args):
     if args.ip and hasattr(model, "ip"):
         query = query.where(model.ip == args.ip)
     total = db.scalar(select(func.count()).select_from(query.subquery()))
-    column = getattr(model, args.sort_by)
+    column = columns[args.sort_by]
+    if args.sort_by in {"details", "evidence"}:
+        column = cast(column, String)
     order = column.asc() if args.sort_order == "asc" else column.desc()
     items = db.scalars(
         query.order_by(order.nulls_last(), model.id.asc())
@@ -198,6 +276,11 @@ def login(body: LoginInput, request: Request, response: Response, db: DB):
             path="/",
         )
     return {"id": user.id, "username": user.username}
+
+
+@router.get("/capabilities")
+def capabilities(user: User):
+    return {"screenshots": settings.eyewitness_enabled, "searchsploit": True}
 
 
 @router.get("/auth/me")
@@ -463,6 +546,7 @@ COLLECTIONS = {
     "credential-attempts": m.Attempt,
     "screenshots": m.Screenshot,
     "findings": m.Finding,
+    "cve": m.CVEMatch,
     "events": m.Event,
     "targets": m.RunTarget,
     "checkpoints": m.Checkpoint,
@@ -480,6 +564,43 @@ def run_collection(run_id: str, collection: str, user: User, db: DB, args: Annot
     if collection == "subdomains":
         query = query.where(m.Finding.kind == "subdomain")
     return paginate(db, model, query, args)
+
+
+def csv_cell(value):
+    if isinstance(value, dict):
+        if "response_headers" in value:
+            value = "\n".join(f"{key}: {item}" for key, item in value["response_headers"])
+        else:
+            value = "\n".join(f"{key}: {csv_cell(item)}" for key, item in value.items())
+    elif isinstance(value, list):
+        value = "\n".join(csv_cell(item) for item in value)
+    value = "" if value is None else str(value)
+    return "'" + value if value.lstrip().startswith(("=", "+", "-", "@")) else value
+
+
+@router.get("/runs/{run_id}/{collection}/export.csv")
+def export_results(run_id: str, collection: str, user: User, db: DB, args: Annotated[Page, Query()]):
+    buffer = io.StringIO(newline="")
+    writer = None
+    args.page, args.page_size = 1, 100
+    while True:
+        data = run_collection(run_id, collection, user, db, args)
+        if writer is None:
+            fields = (
+                list(data["items"][0]) if data["items"] else list(result_columns(COLLECTIONS[collection]))
+            )
+            writer = csv.DictWriter(buffer, fieldnames=fields)
+            writer.writeheader()
+        for item in data["items"]:
+            writer.writerow({key: csv_cell(value) for key, value in item.items()})
+        if args.page >= data["total_pages"]:
+            break
+        args.page += 1
+    return Response(
+        "\ufeff" + buffer.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{collection}-{run_id}.csv"'},
+    )
 
 
 @router.get("/screenshots/{screenshot_id}/content")

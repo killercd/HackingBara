@@ -132,6 +132,7 @@ class RunHost(Entity, Base):
     run_id: Mapped[str] = mapped_column(ForeignKey("scan_runs.id", ondelete="CASCADE"), index=True)
     host_id: Mapped[str] = mapped_column(ForeignKey("hosts.id"))
     ip: Mapped[str] = mapped_column(String(45), index=True)
+    hostname: Mapped[str] = mapped_column(Text, default="")
     source: Mapped[str] = mapped_column(String(64), default="rustscan")
     status: Mapped[str] = mapped_column(String(32), default="new")
     last_seen_at: Mapped[object] = mapped_column(DateTime, default=now)
@@ -259,3 +260,19 @@ class FollowUp(Entity, Base):
     target: Mapped[str] = mapped_column(String(2048))
     reason: Mapped[str] = mapped_column(Text)
     approval_status: Mapped[str] = mapped_column(String(32), default="pending")
+
+
+class CVEMatch(Entity, Base):
+    __tablename__ = "cve_matches"
+    run_id: Mapped[str] = mapped_column(ForeignKey("scan_runs.id", ondelete="CASCADE"), index=True)
+    service_id: Mapped[str] = mapped_column(ForeignKey("services.id"))
+    ip: Mapped[str] = mapped_column(String(45))
+    port: Mapped[int] = mapped_column(Integer)
+    banner: Mapped[str] = mapped_column(Text, default="")
+    query: Mapped[str] = mapped_column(Text, default="")
+    edb_id: Mapped[str] = mapped_column(String(32), default="")
+    cve: Mapped[str] = mapped_column(Text, default="")
+    title: Mapped[str] = mapped_column(Text, default="")
+    url: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="candidate")
+    __table_args__ = (UniqueConstraint("run_id", "service_id", "edb_id"),)

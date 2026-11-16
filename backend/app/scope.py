@@ -144,6 +144,7 @@ class ScanInput(BaseModel):
     password_spray: bool = False
     credential_endpoints: list[str] = Field(default_factory=list, max_length=10)
     screenshots: bool = False
+    searchsploit: bool = False
     # Retained for old configurations; no longer used as a scanner deadline.
     timeout: int = Field(default=120, ge=5, le=600, exclude=True)
     request_timeout: float = Field(default=2, ge=0.001, le=300, allow_inf_nan=False)
@@ -267,6 +268,7 @@ class ScanInput(BaseModel):
                 or self.password_spray
                 or self.credential_endpoints
                 or self.screenshots
+                or self.searchsploit
             ):
                 raise ValueError("Subdomain mode supports DNS enumeration only")
             return self

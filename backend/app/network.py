@@ -24,7 +24,7 @@ def pinned_socket(scope, url, timeout=10):
         raise
 
 
-def request(scope, url, authorization=None):
+def request(scope, url, authorization=None, *, raw_headers=False):
     url = normalize_url(url)
     u = urlsplit(url)
     port = u.port or (443 if u.scheme == "https" else 80)
@@ -44,7 +44,8 @@ def request(scope, url, authorization=None):
         connection.request("GET", u.path + ("?" + u.query if u.query else ""), headers=headers)
         response = connection.getresponse()
         # No redirects are ever followed by credential adapters.
-        return response.status, {k.lower(): v for k, v in response.getheaders()}
+        headers = response.getheaders()
+        return response.status, headers if raw_headers else {k.lower(): v for k, v in headers}
     finally:
         connection.close()
 

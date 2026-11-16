@@ -353,3 +353,37 @@ def prepare_scope(config, tick):
         if data.get("error"):
             raise ScopePreparationError(data["error"], data["issues"])
         return ScanInput.model_validate(data["config"]), data["issues"]
+
+
+def searchsploit(banner, tick):
+    # Tokens from remote banners are data, never CLI flags or shell commands.
+    terms = re.findall(r"[A-Za-z0-9][A-Za-z0-9.+_-]*", banner)[:16]
+    query = " ".join(terms)[:300]
+    if not query:
+        return "", []
+    result = run_tool(
+        ["searchsploit", "--json", "--disable-colour", *query.split()], settings.scanner_timeout, tick
+    )
+    if result.exit_code:
+        raise ToolError(f"SearchSploit exited with code {result.exit_code}")
+    try:
+        rows = json.loads(result.stdout)["RESULTS_EXPLOIT"]
+        if not isinstance(rows, list):
+            raise ValueError("Invalid result list")
+        matches = []
+        for row in rows:
+            edb_id = str(row.get("EDB-ID", ""))
+            if not edb_id.isdigit():
+                continue
+            matches.append(
+                {
+                    "edb_id": edb_id,
+                    "title": str(row.get("Title", ""))[:2000],
+                    "cve": ", ".join(sorted(set(re.findall(r"CVE-\d{4}-\d+", str(row), re.I)))).upper(),
+                    "url": f"https://www.exploit-db.com/exploits/{edb_id}",
+                    "status": "candidate",
+                }
+            )
+        return query, matches
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ToolError("SearchSploit returned invalid JSON") from exc

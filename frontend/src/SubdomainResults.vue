@@ -5,7 +5,7 @@ import DataTable from './DataTable.vue'
 
 const props = defineProps<{run: Record<string, any>}>()
 const route = useRoute(), router = useRouter()
-const tabs = ['subdomains', 'findings', 'events']
+const tabs = ['subdomains', 'events']
 const tab = computed(() => tabs.includes(String(route.query.tab)) ? String(route.query.tab) : 'subdomains')
 const metrics = [
   {key: 'subdomains', label: 'Discovered subdomains'},

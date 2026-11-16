@@ -113,35 +113,41 @@ def capture(scope, url, run_id, screenshot_id, tick):
             "NO_PROXY": "",
         }
         # The image patches EyeWitness's browser options to require this proxy.
-        output = Path(temp) / "output"
+        images = []
         try:
-            result = run_tool(
-                [
-                    "eyewitness",
-                    "--web",
-                    "--single",
-                    url,
-                    "-d",
-                    str(output),
-                    "--threads",
-                    "1",
-                    "--timeout",
-                    "15",
-                    "--no-prompt",
-                ],
-                settings.scanner_timeout,
-                tick,
-                env,
-            )
-            if result.exit_code:
-                raise ToolError(f"EyeWitness exited with code {result.exit_code}")
+            for attempt in range(2):
+                output = Path(temp) / f"output-{attempt}"
+                result = run_tool(
+                    [
+                        "eyewitness",
+                        "--web",
+                        "--single",
+                        url,
+                        "-d",
+                        str(output),
+                        "--threads",
+                        "1",
+                        "--timeout",
+                        "30",
+                        "--no-prompt",
+                    ],
+                    settings.scanner_timeout,
+                    tick,
+                    env,
+                )
+                images = list((output / "screens").glob("*.png"))
+                if not result.exit_code and images:
+                    break
+            else:
+                if result.exit_code:
+                    raise ToolError(f"EyeWitness exited with code {result.exit_code}")
+                if "Timeout connecting" in result.stdout:
+                    raise ToolError("EyeWitness timed out while loading the page")
+                raise ToolError("EyeWitness produced no screenshot after two attempts")
         finally:
             proxy.shutdown()
             proxy.server_close()
             thread.join(timeout=2)
-        images = list((output / "screens").glob("*.png"))
-        if not images:
-            raise ToolError("EyeWitness produced no screenshot")
         image = images[0]
         if image.stat().st_size > settings.max_artifact_bytes:
             raise ToolError("Screenshot exceeds artifact limit")
